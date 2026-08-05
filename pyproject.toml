@@ -1,0 +1,58 @@
+[project]
+name = "notion-mcp"
+version = "0.1.0"
+description = "MCP server for Notion: pages, databases, markdown, comments, and a full file pipeline"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Nick Engel", email = "nick@engel.au" }]
+requires-python = ">=3.12"
+keywords = ["mcp", "model-context-protocol", "notion", "markdown", "files"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business",
+]
+dependencies = [
+    # PDF reading (notion_extract_file_text / notion_render_file_page) —
+    # same stack as the sibling google-accounts-mcp (shared pdf_read
+    # module): pdfplumber for native text, pypdfium2+pillow for
+    # rasterisation. OCR of scans is delegated to an xberg server
+    # (github.com/xberg-io/xberg) over httpx.
+    "pdfplumber>=0.11",
+    "pypdfium2>=4.30",
+    "pillow>=10.0",
+    # <2 pin: mcp 2.0 moved FastMCP out of mcp.server.fastmcp, so an
+    # unpinned build crash-loops on import.
+    "mcp[cli]>=1.0.0,<2",
+    "httpx>=0.27.0",
+    "google-auth>=2.35.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-api-python-client>=2.150.0",
+    "uvicorn>=0.32.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/snickery/notion-mcp"
+Issues = "https://github.com/snickery/notion-mcp/issues"
+
+[project.scripts]
+notion-mcp = "notion_mcp.server:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/notion_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires NOTION_TEST_TOKEN (live API tests)",
+]
