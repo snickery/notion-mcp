@@ -14,6 +14,7 @@ from mcp.server.fastmcp.utilities.types import Image
 from mcp_server_kit import offload_sync_tools, serve
 from mcp_server_kit import pdf as pdf_read
 from mcp_server_kit.files import atomic_create as _atomic_create
+from mcp_server_kit.files import list_files, purge_older, purge_one
 
 from notion_mcp.blocks import (
     blocks_to_markdown,
@@ -338,34 +339,7 @@ def notion_purge_shared_files(
 
     Set dry_run=True to list victims without deleting. Only regular
     files are touched — subdirectories are left alone."""
-    import time
-    if max_age_hours < 0:
-        raise ValueError("max_age_hours must be >= 0")
-    root = Path(SHARED_DIR)
-    if not root.exists():
-        return f"Shared dir {SHARED_DIR} does not exist (nothing to purge)."
-    cutoff = time.time() - max_age_hours * 3600
-    victims = [
-        p for p in root.iterdir()
-        if p.is_file() and p.stat().st_mtime < cutoff
-    ]
-    if not victims:
-        return (
-            f"No files older than {max_age_hours}h in {SHARED_DIR} "
-            f"(dir contains {sum(1 for _ in root.iterdir())} entries)."
-        )
-    verb = "Would delete" if dry_run else "Deleted"
-    lines = [
-        f"{verb} {len(victims)} file(s) older than {max_age_hours}h "
-        f"from {SHARED_DIR}:"
-    ]
-    for p in sorted(victims):
-        age_h = (time.time() - p.stat().st_mtime) / 3600
-        size = p.stat().st_size
-        lines.append(f"  • {p.name}  ({size} bytes, age {age_h:.1f}h)")
-        if not dry_run:
-            p.unlink()
-    return "\n".join(lines)
+    return purge_older(Path(SHARED_DIR), max_age_hours, dry_run)
 
 
 @mcp.tool()
@@ -376,17 +350,7 @@ def notion_purge_file(filename: str) -> str:
     notion_purge_shared_files with max_age_hours=0, which would wipe
     any unrelated in-flight handoffs). Rejects any filename containing
     path separators."""
-    safe_name = os.path.basename(filename)
-    if not safe_name or safe_name != filename:
-        raise ValueError(
-            f"Invalid filename '{filename}' — must be a bare filename."
-        )
-    target = Path(SHARED_DIR) / safe_name
-    if not target.is_file():
-        return f"No such file in shared mount: {safe_name}"
-    size = target.stat().st_size
-    target.unlink()
-    return f"Deleted {safe_name} ({size} bytes) from {SHARED_DIR}."
+    return purge_one(Path(SHARED_DIR), filename)
 
 
 @mcp.tool()
@@ -405,33 +369,15 @@ def notion_list_local_files(filter: str = "", location: str = "files") -> str:
     Optional substring filter on the filename."""
     loc = location.strip().lower()
     if loc == "files":
-        root = Path(FILES_DIR)
-        scheme = "local"
-        label = "notion-mcp local store"
+        root, scheme, label = Path(FILES_DIR), "local", "notion-mcp local store"
     elif loc == "shared":
-        root = Path(SHARED_DIR)
-        scheme = "shared"
-        label = "shared cross-MCP mount"
+        root, scheme, label = Path(SHARED_DIR), "shared", "shared cross-MCP mount"
     else:
         raise ValueError(
             f"location must be 'files' or 'shared', got {location!r}."
         )
     root.mkdir(parents=True, exist_ok=True)
-    files = [p for p in root.rglob("*") if p.is_file()]
-    if filter:
-        files = [p for p in files if filter.lower() in p.name.lower()]
-    if not files:
-        suffix = f" matching '{filter}'" if filter else ""
-        return f"{label} is empty{suffix}."
-    lines = [f"{len(files)} file(s) in {label}:\n"]
-    for p in sorted(files):
-        rel = p.relative_to(root)
-        data = p.read_bytes()
-        lines.append(
-            f"  • {rel}  ({len(data)} bytes, sha256 {_sha256(data)})  "
-            f"[{scheme}:{rel}]"
-        )
-    return "\n".join(lines)
+    return list_files(root, filter, scheme=scheme, label=label, recursive=True)
 
 
 # ---------------------------------------------------------------------------

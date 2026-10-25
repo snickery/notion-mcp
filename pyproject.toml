@@ -1,6 +1,6 @@
 [project]
 name = "notion-mcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "MCP server for Notion: pages, databases, markdown, comments, and a full file pipeline"
 readme = "README.md"
 license = "MIT"
@@ -19,7 +19,7 @@ dependencies = [
     # The kit pins the MCP SDK range (mcp<2) for every server built on it.
     # [pdf]: notion_extract_file_text / notion_render_file_page (pdfplumber, pypdfium2,
     # pillow; OCR via an xberg server over httpx).
-    "mcp-server-kit[pdf]>=0.1,<0.2",
+    "mcp-server-kit[pdf]>=0.1.1,<0.2",
     "mcp[cli]>=1.0.0",
     "httpx>=0.27.0",
     "google-auth>=2.35.0",
