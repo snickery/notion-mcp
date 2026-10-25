@@ -4,7 +4,7 @@ Tests pagination, caching, request body construction, error handling.
 No real API calls are made.
 """
 
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -252,9 +252,49 @@ class TestMarkdownEndpoints:
         mock_request.return_value = {"object": "page_markdown"}
         client.update_page_markdown("page-1", "old text", "new text")
         body = mock_request.call_args[1]["json"]
-        assert body["type"] == "replace_content_range"
-        assert body["replace_content_range"]["content_range"] == "old text"
-        assert body["replace_content_range"]["content"] == "new text"
+        assert body["type"] == "update_content"
+        assert body["update_content"] == {
+            "content_updates": [{"old_str": "old text", "new_str": "new text"}],
+        }
+
+    def test_update_page_markdown_flags(self, client, mock_request):
+        mock_request.return_value = {"object": "page_markdown"}
+        client.update_page_markdown(
+            "page-1", "a", "b", replace_all=True, allow_deleting_content=True,
+        )
+        cmd = mock_request.call_args[1]["json"]["update_content"]
+        assert cmd["content_updates"][0]["replace_all_matches"] is True
+        assert cmd["allow_deleting_content"] is True
+
+    def test_get_page_markdown_v2(self, client, mock_request):
+        mock_request.return_value = {"markdown": "x"}
+        client.get_page_markdown("page-1", markdown_version="v2")
+        assert mock_request.call_args[1]["params"] == {"markdown_version": "v2"}
+
+    def test_replace_page_markdown_is_async_capable(self, client, mock_request):
+        mock_request.return_value = {"object": "page_markdown"}
+        client.replace_page_markdown(
+            "page-1", "x", allow_deleting_content=True, markdown_version="v2",
+        )
+        body = mock_request.call_args[1]["json"]
+        assert body["allow_async"] is True
+        assert body["markdown_version"] == "v2"
+        assert body["replace_content"]["allow_deleting_content"] is True
+
+    @pytest.mark.parametrize("kwargs, expected", [
+        ({"position": "start"}, {"content": "x", "position": {"type": "start"}}),
+        ({"position": "end"}, {"content": "x", "position": {"type": "end"}}),
+        ({"after": "a...b"}, {"content": "x", "after": "a...b"}),
+        ({}, {"content": "x"}),
+    ])
+    def test_insert_page_markdown_placement(self, client, mock_request, kwargs, expected):
+        mock_request.return_value = {"object": "page_markdown"}
+        client.insert_page_markdown("page-1", "x", **kwargs)
+        assert mock_request.call_args[1]["json"]["insert_content"] == expected
+
+    def test_insert_page_markdown_rejects_both(self, client, mock_request):
+        with pytest.raises(ValueError, match="not both"):
+            client.insert_page_markdown("page-1", "x", position="start", after="a...b")
 
     def test_replace_page_markdown(self, client, mock_request):
         mock_request.return_value = {"object": "page_markdown"}
@@ -603,3 +643,234 @@ class TestRequestRetry:
                 patch("notion_mcp.notion_client.time.sleep") as slept:
             client._request("GET", "/pages/x")
         assert slept.call_args[0][0] <= 30.0
+
+
+# ===================================================================
+# 2026-10 gap closure: async tasks, notifications, templates, typed
+# databases, data sources, meeting notes, emojis, uploads, retries
+# ===================================================================
+
+class TestAsyncTasks:
+    def test_sync_response_passes_through(self, client, mock_request):
+        page = {"object": "page", "id": "p1"}
+        assert client.wait_async(page) is page
+        mock_request.assert_not_called()
+
+    def test_polls_until_succeeded(self, client, mock_request):
+        mock_request.side_effect = [
+            {"object": "async_task", "id": "t1", "status": "running",
+             "poll_after_seconds": 0},
+            {"object": "async_task", "id": "t1", "status": "succeeded",
+             "result": {"object": "page", "id": "p1"}},
+        ]
+        with patch("notion_mcp.notion_client.time.sleep"):
+            res = client.wait_async(
+                {"object": "async_task", "id": "t1", "status": "queued",
+                 "poll_after_seconds": 0},
+            )
+        assert res == {"object": "page", "id": "p1"}
+        mock_request.assert_called_with("GET", "/async_tasks/t1")
+
+    def test_failed_task_raises(self, client, mock_request):
+        mock_request.return_value = {
+            "object": "async_task", "id": "t1", "status": "failed",
+            "error": {"code": "validation_error", "message": "bad"},
+        }
+        with patch("notion_mcp.notion_client.time.sleep"), \
+             pytest.raises(RuntimeError, match="validation_error: bad"):
+            client.wait_async(
+                {"object": "async_task", "id": "t1", "status": "queued",
+                 "poll_after_seconds": 0},
+            )
+
+    def test_timeout_returns_pending_task(self, client, mock_request):
+        task = {"object": "async_task", "id": "t1", "status": "queued",
+                "poll_after_seconds": 5}
+        assert client.wait_async(task, timeout=1) is task
+        mock_request.assert_not_called()
+
+
+class TestCreatePageOptions:
+    def test_silent_template_position_icon(self, client, mock_request):
+        mock_request.return_value = {"id": "p1"}
+        client.create_page(
+            properties={}, database_id="db",
+            icon={"type": "icon", "icon": {"name": "pizza"}},
+            template={"type": "default"},
+            position={"type": "page_start"}, silent=True,
+        )
+        body = mock_request.call_args[1]["json"]
+        assert body["notifications"] == {"mode": "silent"}
+        assert body["template"] == {"type": "default"}
+        assert body["position"] == {"type": "page_start"}
+        assert body["icon"] == {"type": "icon", "icon": {"name": "pizza"}}
+        assert "children" not in body and "markdown" not in body
+
+    def test_native_markdown_uses_allow_async(self, client, mock_request):
+        mock_request.return_value = {"object": "page", "id": "p1"}
+        client.create_page(
+            properties={}, parent_page_id="pp", markdown="# x", markdown_version="v2",
+        )
+        body = mock_request.call_args[1]["json"]
+        assert body["markdown"] == "# x"
+        assert body["allow_async"] is True
+        assert body["markdown_version"] == "v2"
+
+    def test_template_excludes_children(self, client, mock_request):
+        with pytest.raises(ValueError, match="template"):
+            client.create_page(
+                properties={}, database_id="db",
+                children=[{"type": "paragraph"}], template={"type": "default"},
+            )
+
+    def test_update_page_silent(self, client, mock_request):
+        client.update_page("p1", {"icon": None}, silent=True)
+        assert mock_request.call_args[1]["json"] == {
+            "icon": None, "notifications": {"mode": "silent"},
+        }
+
+
+class TestAppendBlocksPlacement:
+    def test_position_and_silent_sent(self, client, mock_request):
+        mock_request.return_value = {"results": [{"id": "b1"}]}
+        client.append_blocks(
+            "p1", [{"type": "paragraph"}], position={"type": "start"}, silent=True,
+        )
+        body = mock_request.call_args[1]["json"]
+        assert body["position"] == {"type": "start"}
+        assert body["notifications"] == {"mode": "silent"}
+
+    def test_later_batches_follow_the_positioned_first(self, client, mock_request):
+        mock_request.side_effect = [
+            {"results": [{"id": f"a{i}"} for i in range(100)]},
+            {"results": [{"id": "z"}]},
+        ]
+        client.append_blocks(
+            "p1", [{"type": "paragraph"}] * 101, position={"type": "start"},
+        )
+        second = mock_request.call_args_list[1][1]["json"]
+        assert second["position"] == {
+            "type": "after_block", "after_block": {"id": "a99"},
+        }
+
+    def test_plain_append_sends_no_position(self, client, mock_request):
+        mock_request.return_value = {"results": []}
+        client.append_blocks("p1", [{"type": "paragraph"}])
+        assert set(mock_request.call_args[1]["json"]) == {"children"}
+
+
+class TestDatabaseVariants:
+    def test_schema_goes_in_initial_data_source(self, client, mock_request):
+        client.create_database("pp", "T", {"Name": {"title": {}}}, is_inline=True)
+        body = mock_request.call_args[1]["json"]
+        assert body["initial_data_source"] == {"properties": {"Name": {"title": {}}}}
+        assert body["is_inline"] is True
+        assert "database_type" not in body
+
+    def test_typed_database(self, client, mock_request):
+        client.create_database("pp", database_type="tasks")
+        body = mock_request.call_args[1]["json"]
+        assert body["database_type"] == "tasks"
+        assert "initial_data_source" not in body and "title" not in body
+
+    def test_schema_and_type_are_exclusive(self, client, mock_request):
+        with pytest.raises(ValueError):
+            client.create_database("pp", "T", {"Name": {"title": {}}}, database_type="tasks")
+        with pytest.raises(ValueError):
+            client.create_database("pp", "T")
+
+    def test_create_data_source(self, client, mock_request):
+        client.create_data_source("db1", "Second", {"Name": {"title": {}}})
+        mock_request.assert_called_once()
+        assert mock_request.call_args[0] == ("POST", "/data_sources")
+        assert mock_request.call_args[1]["json"]["parent"] == {
+            "type": "database_id", "database_id": "db1",
+        }
+
+    def test_list_templates_paginates(self, client, mock_request):
+        mock_request.side_effect = [
+            {"templates": [{"id": "t1"}], "has_more": True, "next_cursor": "c"},
+            {"templates": [{"id": "t2"}], "has_more": False, "next_cursor": None},
+        ]
+        assert [t["id"] for t in client.list_templates("ds", name="wk")] == ["t1", "t2"]
+        assert mock_request.call_args_list[0][1]["params"]["name"] == "wk"
+        assert mock_request.call_args_list[1][1]["params"]["start_cursor"] == "c"
+
+
+class TestQueryOptions:
+    def test_is_archived(self, client, mock_request):
+        client.query_data_source_page("ds", is_archived=True)
+        assert mock_request.call_args[1]["json"]["is_archived"] is True
+        assert mock_request.call_args[1]["headers"] is None
+
+    def test_status_group_filter_sends_beta_header(self, client, mock_request):
+        f = {"and": [{"property": "S", "status": {"group_equals": "Complete"}}]}
+        client.query_data_source_page("ds", filter=f)
+        assert mock_request.call_args[1]["headers"] == {
+            "Notion-Beta": "status-group-filters-2026-10-06",
+        }
+
+    def test_ordinary_filter_sends_no_beta_header(self, client, mock_request):
+        client.query_data_source_page(
+            "ds", filter={"property": "S", "status": {"equals": "Done"}},
+        )
+        assert mock_request.call_args[1]["headers"] is None
+
+
+class TestMeetingNotesAndLists:
+    def test_query_meeting_notes_clamps_limit(self, client, mock_request):
+        client.query_meeting_notes(limit=500, sort=[{"property": "title"}])
+        assert mock_request.call_args[0] == ("POST", "/blocks/meeting_notes/query")
+        assert mock_request.call_args[1]["json"] == {
+            "limit": 50, "sort": [{"property": "title"}],
+        }
+
+    def test_create_meeting_notes_is_not_retried(self, client):
+        """Not idempotent: a 529 must surface, not be retried into a duplicate."""
+        resp = MagicMock(status_code=529, text="overloaded")
+        with patch("notion_mcp.notion_client.httpx.Client") as cls, \
+             patch("notion_mcp.notion_client.NOTION_TOKEN", "t"):
+            post = cls.return_value.__enter__.return_value.post
+            post.return_value = resp
+            with pytest.raises(RuntimeError, match="529"):
+                client.create_meeting_notes(
+                    {"type": "file_upload", "file_upload_id": "u"},
+                    parent_page_id="p", title="T", kickoff_summary=False,
+                )
+        assert post.call_count == 1
+        body = post.call_args[1]["json"]
+        assert body["parent"] == {"type": "page_id", "page_id": "p"}
+        assert body["options"] == {"kickoff_summary": False}
+
+    def test_list_custom_emojis_name_filter(self, client, mock_request):
+        mock_request.return_value = {"results": [{"id": "e1"}], "has_more": False}
+        assert client.list_custom_emojis(name="party") == [{"id": "e1"}]
+        assert mock_request.call_args[1]["params"]["name"] == "party"
+
+    def test_list_file_uploads(self, client, mock_request):
+        client.list_file_uploads(status="failed", page_size=500)
+        assert mock_request.call_args[1]["params"] == {
+            "page_size": 100, "status": "failed",
+        }
+
+    def test_attach_html_embed(self, client, mock_request):
+        client.attach_html_embed("p1", "u1", position={"type": "start"})
+        body = mock_request.call_args[1]["json"]
+        assert body["children"][0]["embed"] == {
+            "type": "file_upload", "file_upload": {"id": "u1"},
+        }
+        assert body["position"] == {"type": "start"}
+
+
+class TestRetryAfterBody:
+    def test_body_retry_after_used_when_header_absent(self, client):
+        limited = MagicMock(status_code=429, headers={}, content=b"x")
+        limited.json.return_value = {"additional_data": {"retry_after": 7}}
+        ok = MagicMock(status_code=200, headers={}, content=b"{}")
+        ok.json.return_value = {"ok": True}
+        with patch("notion_mcp.notion_client.httpx.Client") as cls, \
+             patch("notion_mcp.notion_client.NOTION_TOKEN", "t"), \
+             patch("notion_mcp.notion_client.time.sleep") as sleep:
+            cls.return_value.__enter__.return_value.request.side_effect = [limited, ok]
+            assert client._request("GET", "/x") == {"ok": True}
+        sleep.assert_called_once_with(7.0)

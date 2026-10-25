@@ -1,35 +1,133 @@
-"""Google Drive client that reuses google-accounts-mcp's stored refresh tokens.
+"""Google Drive client for the optional `drive:` file scheme.
 
-The companion google-accounts-mcp server persists refresh tokens in a SQLite database keyed by
-email. We mount that directory into the notion-mcp container read-only and
-open the DB in SQLite read-only mode (`mode=ro`) so there is zero chance of
-clobbering the companion server's state. Access tokens are minted in-memory on demand —
-the refresh exchange is a pure HTTP call to Google, nothing is written back.
+Access tokens come from one of two places (see config.py):
 
-Scope note: google-accounts-mcp requests `drive.file`, which grants per-app access to
-files the app created. Because notion-mcp uses the same GOOGLE_CLIENT_ID,
-Google treats it as the same app — so files uploaded via google-accounts-mcp's
-drive_upload are readable/writable here, and vice versa.
+Broker mode (GOOGLE_AUTH_URL set): a google-auth token broker hands out
+short-lived access tokens over HTTP. No client secret or refresh token lives
+here, and BrokerCredentials.refresh() asks the broker again whenever the
+cached Drive service needs a new token — so a re-authorised account works
+without a restart.
+
+Local mode (GOOGLE_AUTH_URL unset): the companion google-accounts-mcp server
+persists refresh tokens in a SQLite database keyed by email. We open that DB
+in SQLite read-only mode (`mode=ro`) so there is zero chance of clobbering
+the companion server's state, and mint access tokens in memory — nothing is
+written back.
+
+Scope note: the tokens carry `drive.file`, which grants per-app access to
+files the app created. Both modes use the same OAuth client as
+google-accounts-mcp, so Google treats them as the same app — files uploaded
+via google-accounts-mcp's drive_upload are readable/writable here, and vice
+versa.
 """
-import base64
 import io
 import mimetypes
 import sqlite3
-from pathlib import Path
+from datetime import UTC, datetime
 
-from google.oauth2.credentials import Credentials
+from google.auth.credentials import Credentials as BaseCredentials
 from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
+from google.oauth2.credentials import Credentials
 
+from notion_mcp.broker_client import BrokerClient, BrokerError
 from notion_mcp.config import (
     DRIVE_ACCOUNT,
     DRIVE_FOLDER_NAME,
-    GOOGLE_TOKEN_DB_PATH,
+    GOOGLE_AUTH_BEARER,
+    GOOGLE_AUTH_URL,
     GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET,
+    GOOGLE_TOKEN_DB_PATH,
 )
+
+
+# googleapiclient adds ~8 MiB to the process and most sessions never touch Drive, so it
+# loads on first use. The names match what they replace (tests patch `build`).
+def build(*args, **kwargs):
+    from googleapiclient.discovery import build as _build
+
+    return _build(*args, **kwargs)
+
+
+def _http_error():
+    """googleapiclient's HttpError, for `except _http_error() as e:` (evaluated only once
+    an exception is in flight)."""
+    from googleapiclient.errors import HttpError
+
+    return HttpError
+
+
+def MediaInMemoryUpload(*args, **kwargs):
+    from googleapiclient.http import MediaInMemoryUpload as _Upload
+
+    return _Upload(*args, **kwargs)
+
+
+def MediaIoBaseDownload(*args, **kwargs):
+    from googleapiclient.http import MediaIoBaseDownload as _Download
+
+    return _Download(*args, **kwargs)
+
+# google-auth treats a token as expired 225 s before its expiry; a smaller
+# min_ttl would make the broker client hand back the same cached token.
+BROKER_MIN_TTL = 300
+DRIVE_SCOPE = "drive.file"
+
+
+class DriveAuthError(ValueError):
+    """Drive auth failed in a way the user can act on."""
+
+
+def _broker_error_message(e: BrokerError, account: str) -> str:
+    if e.code == "reauth_required":
+        return (
+            f"Google rejected the stored authorisation for '{account}'. "
+            "Re-authorise it in the google-auth UI (Reissue token), then "
+            "retry — no restart needed."
+        )
+    if e.code == "forbidden":
+        return (
+            f"'{account}' is not shared with notion-mcp in google-auth. "
+            "Grant it to the notion-mcp service in the google-auth UI."
+        )
+    if e.code == "insufficient_scope":
+        missing = ", ".join(e.detail.get("missing") or []) or DRIVE_SCOPE
+        return (
+            f"'{account}' lacks a Google scope Drive needs ({missing}). "
+            "Add it to the grant / re-authorise the account in the "
+            "google-auth UI."
+        )
+    if e.code == "unknown_account":
+        return f"google-auth has no account '{account}'. Add it in the google-auth UI."
+    if e.code == "unauthorized":
+        return "The google-auth broker rejected GOOGLE_AUTH_BEARER."
+    return (
+        f"google-auth broker unavailable at {GOOGLE_AUTH_URL} "
+        f"({e.message}). This is usually transient — retry."
+    )
+
+
+class BrokerCredentials(BaseCredentials):
+    """google-auth credentials whose refresh() asks the token broker."""
+
+    def __init__(self, client: BrokerClient, account: str):
+        super().__init__()
+        self._client = client
+        self._account = account
+
+    def refresh(self, request):
+        # Refresh of a token google-auth still considers valid means the
+        # API answered 401: bypass the client cache.
+        force = self.token is not None and not self.expired
+        try:
+            info = self._client.token_info(self._account, DRIVE_SCOPE, force=force)
+        except BrokerError as e:
+            raise DriveAuthError(_broker_error_message(e, self._account)) from e
+        self.token = info["access_token"]
+        # google-auth compares against a naive UTC datetime.
+        self.expiry = datetime.fromtimestamp(
+            info["expires_at"], UTC
+        ).replace(tzinfo=None)
 
 
 class DriveClient:
@@ -55,16 +153,18 @@ class DriveClient:
             )
         return row[0]
 
-    def _get_service(self):
-        if self._service is not None:
-            return self._service
-        if not DRIVE_ACCOUNT:
-            raise ValueError(
-                "DRIVE_ACCOUNT is not configured. The drive: scheme is an "
-                "optional feature backed by the companion google-accounts-mcp "
-                "server's token DB — set GOOGLE_TOKEN_DB_PATH, DRIVE_ACCOUNT, "
-                "and the GOOGLE_CLIENT_* vars to enable it."
+    def _broker_credentials(self) -> BrokerCredentials:
+        if not GOOGLE_AUTH_BEARER:
+            raise DriveAuthError(
+                "GOOGLE_AUTH_URL is set but GOOGLE_AUTH_BEARER is not. Set "
+                "this service's google-auth bearer token."
             )
+        client = BrokerClient(
+            GOOGLE_AUTH_URL, GOOGLE_AUTH_BEARER, min_ttl=BROKER_MIN_TTL
+        )
+        return BrokerCredentials(client, DRIVE_ACCOUNT)
+
+    def _local_credentials(self) -> Credentials:
         if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
             raise ValueError(
                 "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set. These must "
@@ -76,13 +176,29 @@ class DriveClient:
         # request a wider scope than the refresh token was granted. Without
         # it we get an access token scoped to whatever the refresh token
         # originally received (matches google-accounts-mcp's own auth.py).
-        creds = Credentials(
+        return Credentials(
             token=None,
             refresh_token=refresh_token,
             token_uri="https://oauth2.googleapis.com/token",
             client_id=GOOGLE_CLIENT_ID,
             client_secret=GOOGLE_CLIENT_SECRET,
         )
+
+    def _get_service(self):
+        if self._service is not None:
+            return self._service
+        if not DRIVE_ACCOUNT:
+            raise ValueError(
+                "DRIVE_ACCOUNT is not configured. The drive: scheme is an "
+                "optional feature — set DRIVE_ACCOUNT plus either "
+                "GOOGLE_AUTH_URL + GOOGLE_AUTH_BEARER (token broker) or "
+                "GOOGLE_TOKEN_DB_PATH + the GOOGLE_CLIENT_* vars (companion "
+                "google-accounts-mcp token DB) to enable it."
+            )
+        if GOOGLE_AUTH_URL:
+            creds = self._broker_credentials()
+        else:
+            creds = self._local_credentials()
         creds.refresh(Request())
         self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
         return self._service
@@ -183,7 +299,9 @@ class DriveClient:
             f = service.files().get(
                 fileId=name_or_id, fields="id, name, mimeType, parents"
             ).execute()
-        except HttpError as e:
+        except _http_error() as e:
+            if e.resp.status != 404:
+                raise
             raise ValueError(f"Drive file '{name_or_id}' not found.") from e
         if folder_id not in (f.get("parents") or []):
             raise ValueError(

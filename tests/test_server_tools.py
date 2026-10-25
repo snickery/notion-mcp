@@ -118,8 +118,9 @@ class TestNotionQueryDatabase:
 
 class TestNotionBatchAddFileToRow:
     def test_processes_each_item(self):
-        import notion_mcp.server as server
         import json
+
+        import notion_mcp.server as server
 
         def fake_add(page_id, source, files_property, mode, filename):
             return {
@@ -147,8 +148,9 @@ class TestNotionBatchAddFileToRow:
         assert "Summary: 2 ok, 0 failed" in out
 
     def test_partial_failure_does_not_abort(self):
-        import notion_mcp.server as server
         import json
+
+        import notion_mcp.server as server
 
         def fake_add(page_id, source, *a, **kw):
             if page_id == "bad":
@@ -184,8 +186,9 @@ class TestNotionBatchAddFileToRow:
             server.notion_batch_add_file_to_row("not json")
 
     def test_missing_fields_are_reported_not_raised(self):
-        import notion_mcp.server as server
         import json
+
+        import notion_mcp.server as server
         items = [{"page_id": "p1"}]  # missing source + files_property
         out = server.notion_batch_add_file_to_row(json.dumps(items))
         assert "SKIP" in out
@@ -230,6 +233,7 @@ class TestNotionDownloadFileShared:
 
     def test_writes_to_shared_mount(self, tmp_shared_dir):
         import hashlib
+
         import notion_mcp.server as server
         payload = b"%PDF-1.4 notion bytes"
         with self._patch_fetch(server, payload):
@@ -273,6 +277,7 @@ class TestNotionDownloadFileShared:
 class TestListLocalFilesSha:
     def test_shared_listing_includes_sha256(self, tmp_shared_dir):
         import hashlib
+
         import notion_mcp.server as server
         (tmp_shared_dir / "x.bin").write_bytes(b"abc")
         out = server.notion_list_local_files(location="shared")
@@ -458,8 +463,11 @@ class TestSetPageVisual:
 
 class TestBatchConcurrency:
     def test_runs_in_parallel_but_bounded_and_ordered(self, monkeypatch):
+        import json
+        import threading
+        import time
+
         import notion_mcp.server as server
-        import json, threading, time
         monkeypatch.setattr(server, "_BATCH_CONCURRENCY", 3)
         cur = {"n": 0, "max": 0}
         lk = threading.Lock()
@@ -488,8 +496,11 @@ class TestBatchConcurrency:
         assert positions == sorted(positions)
 
     def test_same_page_never_overlaps(self, monkeypatch):
+        import json
+        import threading
+        import time
+
         import notion_mcp.server as server
-        import json, threading, time
         monkeypatch.setattr(server, "_BATCH_CONCURRENCY", 4)
         state = {"active": 0, "overlapped": False}
         lk = threading.Lock()
@@ -514,8 +525,9 @@ class TestBatchConcurrency:
         assert "Summary: 4 ok, 0 failed" in out
 
     def test_large_batch_soft_warn(self, monkeypatch):
-        import notion_mcp.server as server
         import json
+
+        import notion_mcp.server as server
         monkeypatch.setattr(server, "_BATCH_CONCURRENCY", 3)
 
         def fake_add(page_id, source, files_property, mode, filename):
@@ -529,3 +541,346 @@ class TestBatchConcurrency:
                 json.dumps(items), default_files_property="F")
         assert "⚠ Large batch" in out
         assert "Summary: 40 ok, 0 failed" in out
+
+
+# ===================================================================
+# 2026-10 gap closure
+# ===================================================================
+
+class TestIconParam:
+    def test_forms(self):
+        import notion_mcp.server as server
+        assert server._icon_param("remove") is None
+        assert server._icon_param("🚀") == {"type": "emoji", "emoji": "🚀"}
+        assert server._icon_param("icon:pizza:blue") == {
+            "type": "icon", "icon": {"name": "pizza", "color": "blue"},
+        }
+        assert server._icon_param("icon:pizza") == {
+            "type": "icon", "icon": {"name": "pizza"},
+        }
+        assert server._icon_param("https://x.test/i.png") == {
+            "type": "external", "external": {"url": "https://x.test/i.png"},
+        }
+
+    def test_custom_emoji_by_id_skips_lookup(self):
+        import notion_mcp.server as server
+        uid = "43833259-72ae-404e-8441-b6577f3159b4"
+        with patch.object(server.notion, "list_custom_emojis") as m:
+            assert server._icon_param(f"custom_emoji:{uid}") == {
+                "type": "custom_emoji", "custom_emoji": {"id": uid},
+            }
+            m.assert_not_called()
+
+    def test_custom_emoji_by_name_is_resolved(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "list_custom_emojis",
+                          return_value=[{"id": "e-1", "name": "party"}]) as m:
+            assert server._icon_param("custom_emoji::party:") == {
+                "type": "custom_emoji", "custom_emoji": {"id": "e-1"},
+            }
+            m.assert_called_once_with(name="party")
+
+    def test_unknown_custom_emoji_is_an_error(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "list_custom_emojis", return_value=[]), \
+             pytest.raises(ValueError, match="No custom emoji"):
+            server._icon_param("custom_emoji:nope")
+
+
+class TestCreatePageOptions:
+    def _create(self, **kw):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "create_page",
+                          return_value={"id": "p1", "url": "u"}) as m:
+            out = server.notion_create_page("T", parent_page_id="pp", **kw)
+        return out, (m.call_args[1] if m.called else None)
+
+    def test_default_converts_markdown_to_blocks(self):
+        _, kw = self._create(content="hello")
+        assert kw["children"] and kw["markdown"] == ""
+        assert kw["silent"] is False and kw["template"] is None
+
+    def test_native_markdown_sends_text(self):
+        _, kw = self._create(content="hello", native_markdown=True, markdown_version="v2")
+        assert kw["children"] is None
+        assert kw["markdown"] == "hello" and kw["markdown_version"] == "v2"
+
+    def test_template_default_and_id(self):
+        _, kw = self._create(template="default", silent=True)
+        assert kw["template"] == {"type": "default"} and kw["silent"] is True
+        _, kw = self._create(template="tpl-1")
+        assert kw["template"] == {"type": "template_id", "template_id": "tpl-1"}
+
+    def test_template_with_content_is_refused(self):
+        out, kw = self._create(template="default", content="x")
+        assert kw is None and "template" in out
+
+    def test_position_forms(self):
+        assert self._create(position="start")[1]["position"] == {"type": "page_start"}
+        assert self._create(position="end")[1]["position"] == {"type": "page_end"}
+        assert self._create(position="blk")[1]["position"] == {
+            "type": "after_block", "after_block": {"id": "blk"},
+        }
+
+    def test_pending_async_task_is_reported(self):
+        import notion_mcp.server as server
+        task = {"object": "async_task", "id": "t9", "status": "running"}
+        with patch.object(server.notion, "create_page", return_value=task):
+            out = server.notion_create_page(
+                "T", parent_page_id="pp", content="x", native_markdown=True,
+            )
+        assert "t9" in out and "notion_get_async_task" in out
+
+
+class TestWriteToolWiring:
+    def test_update_page_silent_and_icon(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "update_page") as m:
+            server.notion_update_page("p1", icon="remove", silent=True)
+        assert m.call_args[0] == ("p1", {"icon": None})
+        assert m.call_args[1] == {"silent": True}
+
+    def test_append_content_position_and_silent(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "append_blocks", return_value=[{}]) as m:
+            server.notion_append_content("p1", "hi", position="start", silent=True)
+        assert m.call_args[1] == {"position": {"type": "start"}, "silent": True}
+
+    def test_insert_page_content(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "insert_page_markdown") as m:
+            server.notion_insert_page_content("p1", "x", position="start")
+            assert m.call_args[1] == {"position": "start", "after": ""}
+            server.notion_insert_page_content("p1", "x", after="a...b")
+            assert m.call_args[1] == {"position": "", "after": "a...b"}
+            m.reset_mock()
+            assert "position must be" in server.notion_insert_page_content(
+                "p1", "x", position="middle",
+            )
+            m.assert_not_called()
+
+    def test_replace_reports_pending_task(self):
+        import notion_mcp.server as server
+        task = {"object": "async_task", "id": "t1", "status": "queued"}
+        with patch.object(server.notion, "replace_page_markdown", return_value=task):
+            assert "t1" in server.notion_replace_page_content("p1", "x")
+        with patch.object(server.notion, "replace_page_markdown",
+                          return_value={"object": "page_markdown"}):
+            assert server.notion_replace_page_content("p1", "x").startswith("Replaced")
+
+    def test_get_async_task_states(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "get_async_task", return_value={
+            "status": "succeeded", "result": {"object": "page", "id": "p1"},
+        }):
+            assert "page p1" in server.notion_get_async_task("t1")
+        with patch.object(server.notion, "get_async_task", return_value={
+            "status": "failed", "error": {"code": "c", "message": "m"},
+        }):
+            assert "c: m" in server.notion_get_async_task("t1")
+        with patch.object(server.notion, "get_async_task", return_value={
+            "status": "running", "poll_after_seconds": 3,
+        }):
+            assert "3s" in server.notion_get_async_task("t1")
+
+    def test_upload_embed_html(self, tmp_shared_dir):
+        import notion_mcp.server as server
+        (tmp_shared_dir / "w.html").write_text("<h1>x</h1>")
+        (tmp_shared_dir / "w.txt").write_text("x")
+        with patch.object(server, "_upload_bytes_to_notion", return_value="u1") as up, \
+             patch.object(server.notion, "attach_html_embed",
+                          return_value={"results": [{"id": "b1"}]}) as emb, \
+             patch.object(server.notion, "attach_file_to_page") as plain:
+            out = server.notion_upload_file("shared:w.html", "p1", embed_html=True)
+            assert up.call_args[0][2] == "text/html"
+            emb.assert_called_once()
+            plain.assert_not_called()
+            assert "Block type: embed" in out
+            with pytest.raises(ValueError, match="html"):
+                server.notion_upload_file("shared:w.txt", "p1", embed_html=True)
+
+
+class TestAddTabs:
+    def test_labels_then_content(self):
+        import notion_mcp.server as server
+        tabs = '[{"label": "A", "icon": "📋", "content": "hello"}, {"label": "B"}]'
+        with patch.object(server.notion, "append_blocks",
+                          return_value=[{"id": "tab-1"}]) as app, \
+             patch.object(server.notion, "list_children",
+                          return_value=[{"id": "item-a"}, {"id": "item-b"}]):
+            out = server.notion_add_tabs("p1", tabs)
+        first = app.call_args_list[0]
+        items = first[0][1][0]["tab"]["children"]
+        assert [i["paragraph"].get("icon") for i in items] == [{"emoji": "📋"}, None]
+        # only tab A has content, appended under its own item
+        assert len(app.call_args_list) == 2
+        assert app.call_args_list[1][0][0] == "item-a"
+        assert "tab-1" in out
+
+    def test_rejects_bad_json_shape(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "append_blocks") as app:
+            assert "tabs_json must be" in server.notion_add_tabs("p1", '[{"x": 1}]')
+            app.assert_not_called()
+
+
+class TestDatabaseTools:
+    def test_create_requires_exactly_one_of_schema_or_type(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "create_database") as m:
+            assert "exactly one" in server.notion_create_database("pp", "T")
+            assert "exactly one" in server.notion_create_database(
+                "pp", "T", schema_json='{"N": {"title": {}}}', database_type="tasks",
+            )
+            m.assert_not_called()
+
+    def test_create_typed(self):
+        import notion_mcp.server as server
+        db = {"id": "d1", "title": [{"plain_text": "Tasks"}]}
+        with patch.object(server.notion, "create_database", return_value=db) as m:
+            out = server.notion_create_database("pp", database_type="tasks", inline=True)
+        assert m.call_args[1] == {
+            "properties": None, "database_type": "tasks", "is_inline": True,
+        }
+        assert "Title: Tasks" in out
+
+    def test_query_archived_and_limit_warning(self):
+        import notion_mcp.server as server
+        envelope = {
+            "results": [_row("p1", "Row 1")], "has_more": False,
+            "request_status": {
+                "type": "incomplete",
+                "incomplete_reason": "query_result_limit_reached",
+            },
+        }
+        with patch.object(server.notion, "resolve_data_source_id", return_value="ds"), \
+             patch.object(server.notion, "query_data_source_page",
+                          return_value=envelope) as m:
+            out = server.notion_query_database("db", archived=True)
+        assert m.call_args[1]["is_archived"] is True
+        assert "10,000-result limit" in out
+
+    def test_list_templates(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "resolve_data_source_id", return_value="ds"), \
+             patch.object(server.notion, "list_templates", return_value=[
+                 {"id": "t1", "name": "Weekly", "is_default": True},
+             ]):
+            out = server.notion_list_templates("db")
+        assert "Weekly (default)" in out and "t1" in out
+
+
+class TestMeetingNotesTools:
+    BLOCK = {
+        "id": "mn-1", "type": "meeting_notes", "created_time": "2026-10-01T00:00:00Z",
+        "meeting_notes": {
+            "title": [{"plain_text": "Sync"}], "status": "notes_ready",
+            "children": {"summary_block_id": "s-1", "notes_block_id": "n-1"},
+            "calendar_event": {"attendees": ["u1", "u2"],
+                               "start_time": "2026-10-01T10:00:00Z"},
+        },
+    }
+
+    def test_query_defaults_and_title_filter(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "query_meeting_notes", return_value={
+            "results": [self.BLOCK], "has_more": True,
+        }) as m:
+            out = server.notion_query_meeting_notes(title_contains="Sync")
+        assert m.call_args[1]["filter"] == {
+            "property": "title", "filter": {"string_contains": "Sync"},
+        }
+        assert m.call_args[1]["sort"][0]["direction"] == "descending"
+        assert "Sync [notes_ready]" in out and "attendees: 2" in out
+        assert "More exist" in out
+
+    def test_read_section(self):
+        import notion_mcp.server as server
+        para = {"id": "x", "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "plain_text": "Decided X",
+                                             "text": {"content": "Decided X"}}]}}
+        with patch.object(server.notion, "retrieve_block", return_value=self.BLOCK), \
+             patch.object(server.notion, "get_block_children_deep",
+                          return_value=[para]) as deep:
+            out = server.notion_read_meeting_notes("mn-1")
+            deep.assert_called_once_with("s-1")
+            assert "Decided X" in out
+            # transcript id is absent on this block
+            assert "no transcript yet" in server.notion_read_meeting_notes(
+                "mn-1", section="transcript",
+            )
+
+    def test_read_rejects_other_blocks_and_sections(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "retrieve_block",
+                          return_value={"id": "b", "type": "paragraph"}):
+            assert "not meeting notes" in server.notion_read_meeting_notes("b")
+        assert "section must be" in server.notion_read_meeting_notes("b", section="x")
+
+    def test_create_from_existing_block(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "create_meeting_notes",
+                          return_value={"id": "mn-2"}) as m, \
+             patch.object(server, "_upload_bytes_to_notion") as up:
+            out = server.notion_create_meeting_notes("notion:blk-1", summarize=False)
+        up.assert_not_called()
+        assert m.call_args[0][0] == {"type": "block", "block_id": "blk-1"}
+        assert m.call_args[1]["kickoff_summary"] is False
+        assert "mn-2" in out
+
+    def test_create_from_file_needs_parent_and_fixes_m4a_mime(self, tmp_shared_dir):
+        import notion_mcp.server as server
+        (tmp_shared_dir / "call.m4a").write_bytes(b"\x00\x01")
+        with patch.object(server.notion, "create_meeting_notes",
+                          return_value={"id": "mn-3"}) as m, \
+             patch.object(server, "_upload_bytes_to_notion", return_value="u1") as up:
+            assert "parent_page_id is required" in server.notion_create_meeting_notes(
+                "shared:call.m4a",
+            )
+            m.assert_not_called()
+            server.notion_create_meeting_notes("shared:call.m4a", parent_page_id="p1")
+        assert up.call_args[0][2] == "audio/mp4"
+        assert m.call_args[0][0] == {"type": "file_upload", "file_upload_id": "u1"}
+        assert m.call_args[1]["parent_page_id"] == "p1"
+
+
+class TestSmallReadTools:
+    def test_get_user_me_shows_workspace(self):
+        import notion_mcp.server as server
+        bot = {"id": "b1", "name": "Bot", "type": "bot", "bot": {
+            "owner": {"type": "workspace"}, "workspace_name": "Home",
+            "workspace_limits": {"max_file_upload_size_in_bytes": 5},
+        }}
+        with patch.object(server.notion, "get_user", return_value=bot) as m:
+            out = server.notion_get_user("me")
+        m.assert_called_once_with("me")
+        assert "workspace: Home" in out and "max file upload: 5 bytes" in out
+
+    def test_get_comment(self):
+        import notion_mcp.server as server
+        c = {"id": "c1", "rich_text": [{"plain_text": "hi"}],
+             "created_by": {"id": "u1"}, "discussion_id": "d1",
+             "parent": {"type": "page_id", "page_id": "p1"}}
+        with patch.object(server.notion, "retrieve_comment", return_value=c):
+            out = server.notion_get_comment("c1")
+        assert "hi" in out and "discussion_id: d1" in out and "parent: p1" in out
+
+    def test_list_custom_emojis_and_uploads(self):
+        import notion_mcp.server as server
+        with patch.object(server.notion, "list_custom_emojis",
+                          return_value=[{"id": "e1", "name": "party"}]):
+            assert ":party:" in server.notion_list_custom_emojis()
+        with patch.object(server.notion, "list_file_uploads", return_value={
+            "results": [{"id": "u1", "filename": "a.pdf", "status": "uploaded",
+                         "content_type": "application/pdf", "content_length": 9}],
+            "has_more": False,
+        }):
+            assert "a.pdf [uploaded]" in server.notion_list_file_uploads()
+
+    def test_list_users_name_filter(self):
+        import notion_mcp.server as server
+        users = [{"id": "1", "name": "Nick", "type": "person"},
+                 {"id": "2", "name": "Bot", "type": "bot"}]
+        with patch.object(server.notion, "list_users", return_value=users):
+            out = server.notion_list_users(name_contains="nic")
+        assert "Nick" in out and "Bot" not in out

@@ -1,6 +1,6 @@
 [project]
 name = "notion-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for Notion: pages, databases, markdown, comments, and a full file pipeline"
 readme = "README.md"
 license = "MIT"
@@ -16,22 +16,15 @@ classifiers = [
     "Topic :: Office/Business",
 ]
 dependencies = [
-    # PDF reading (notion_extract_file_text / notion_render_file_page) —
-    # same stack as the sibling google-accounts-mcp (shared pdf_read
-    # module): pdfplumber for native text, pypdfium2+pillow for
-    # rasterisation. OCR of scans is delegated to an xberg server
-    # (github.com/xberg-io/xberg) over httpx.
-    "pdfplumber>=0.11",
-    "pypdfium2>=4.30",
-    "pillow>=10.0",
-    # <2 pin: mcp 2.0 moved FastMCP out of mcp.server.fastmcp, so an
-    # unpinned build crash-loops on import.
-    "mcp[cli]>=1.0.0,<2",
+    # The kit pins the MCP SDK range (mcp<2) for every server built on it.
+    # [pdf]: notion_extract_file_text / notion_render_file_page (pdfplumber, pypdfium2,
+    # pillow; OCR via an xberg server over httpx).
+    "mcp-server-kit[pdf]>=0.1,<0.2",
+    "mcp[cli]>=1.0.0",
     "httpx>=0.27.0",
     "google-auth>=2.35.0",
     "google-auth-httplib2>=0.2.0",
     "google-api-python-client>=2.150.0",
-    "uvicorn>=0.32.0",
 ]
 
 [project.urls]

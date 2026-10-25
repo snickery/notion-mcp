@@ -15,9 +15,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from mcp_server_kit import pdf as pdf_read
 
 import notion_mcp.server as server
-from notion_mcp import pdf_read
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SCANNED = (FIXTURES / "scanned.pdf").read_bytes()
@@ -188,8 +188,8 @@ class TestRenderFilePage:
 
 
 # ===================================================================
-# pdf_read copy sanity — the module must stay import-identical in
-# behaviour to gmail-mcp's copy; spot-check the shared surface here.
+# pdf_read surface — the module is mcp_server_kit.pdf now (tested there);
+# spot-check that the names this server calls still exist.
 # ===================================================================
 
 

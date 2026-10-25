@@ -11,11 +11,10 @@ MCP Test Sandbox page. Nothing is left behind on success.
 """
 
 import os
-import time
 
 import pytest
 
-from tests.conftest import requires_notion, SANDBOX_PAGE_ID, SANDBOX_DB_ID
+from tests.conftest import SANDBOX_DB_ID, SANDBOX_PAGE_ID, requires_notion
 
 
 # Patch the config module before importing the client, so the client
@@ -117,7 +116,7 @@ class TestPageCRUD:
 @requires_notion
 class TestBlocks:
     def test_append_and_read_blocks(self, client, test_page):
-        from notion_mcp.blocks import markdown_to_blocks, blocks_to_markdown
+        from notion_mcp.blocks import blocks_to_markdown, markdown_to_blocks
 
         blocks = markdown_to_blocks("# Test Heading\n\nA paragraph.")
         added = client.append_blocks(test_page, blocks)
@@ -316,3 +315,123 @@ class TestViews:
             assert renamed["name"] == "integration-view-2"
         finally:
             client.delete_view(vid)
+
+
+# ===================================================================
+# 2026-10 gap closure — request shapes verified against the live API
+# ===================================================================
+
+@requires_notion
+class TestGapClosure:
+    def test_native_markdown_create_silent_at_start(self, client):
+        page = client.create_page(
+            properties={"title": [{"text": {"content": "Gap: native create"}}]},
+            parent_page_id=SANDBOX_PAGE_ID,
+            markdown="# Heading\n\nnative body",
+            position={"type": "page_start"},
+            silent=True,
+        )
+        try:
+            assert page.get("object") == "page"  # async task resolved
+            assert "native body" in client.get_page_markdown(page["id"])
+        finally:
+            client.archive_page(page["id"])
+
+    def test_markdown_insert_update_replace(self, client, test_page):
+        client.insert_page_markdown(test_page, "middle line")
+        client.insert_page_markdown(test_page, "first line", position="start")
+        client.insert_page_markdown(test_page, "after middle", after="middle line")
+        md = client.get_page_markdown(test_page)
+        assert md.index("first line") < md.index("middle line") < md.index("after middle")
+
+        client.update_page_markdown(test_page, "middle line", "centre line")
+        assert "centre line" in client.get_page_markdown(test_page)
+
+        res = client.replace_page_markdown(test_page, "only this")
+        assert res.get("object") != "async_task"
+        md = client.get_page_markdown(test_page, markdown_version="v2")
+        assert "only this" in md and "first line" not in md
+
+    def test_update_content_ambiguous_match_needs_replace_all(self, client, test_page):
+        client.insert_page_markdown(test_page, "dup\n\ndup")
+        with pytest.raises(RuntimeError, match="validation_error"):
+            client.update_page_markdown(test_page, "dup", "one")
+        client.update_page_markdown(test_page, "dup", "one", replace_all=True)
+        assert "dup" not in client.get_page_markdown(test_page)
+
+    def test_append_at_start_and_silent_update(self, client, test_page):
+        def para(text):
+            return {"type": "paragraph",
+                    "paragraph": {"rich_text": [{"text": {"content": text}}]}}
+        client.append_blocks(test_page, [para("second")])
+        client.append_blocks(
+            test_page, [para("first")], position={"type": "start"}, silent=True,
+        )
+        texts = [
+            b["paragraph"]["rich_text"][0]["plain_text"]
+            for b in client.list_children(test_page)
+        ]
+        assert texts == ["first", "second"]
+        client.update_page(
+            test_page, {"icon": {"type": "icon", "icon": {"name": "pizza", "color": "blue"}}},
+            silent=True,
+        )
+        assert client.retrieve_page(test_page)["icon"]["type"] == "icon"
+
+    def test_tabs_and_html_embed_round_trip(self, client, test_page):
+        import notion_mcp.server as server
+        from notion_mcp.blocks import blocks_to_markdown
+        server.notion_add_tabs(
+            test_page,
+            '[{"label": "Alpha", "icon": "📋", "content": "- in alpha\\n  - nested"},'
+            ' {"label": "Beta"}]',
+        )
+        md = blocks_to_markdown(client.get_block_children_deep(test_page))
+        assert "**[Tab: 📋 Alpha]**" in md and "**[Tab: Beta]**" in md
+        assert "in alpha" in md and "nested" in md
+
+        upload_id = server._upload_bytes_to_notion(
+            b"<html><body><h1>hi</h1></body></html>", "gap.html", "text/html",
+        )
+        res = client.attach_html_embed(test_page, upload_id)
+        assert res["results"][0]["type"] == "embed"
+
+    def test_database_variants_templates_and_query_options(self, client, test_page):
+        db = client.create_database(
+            test_page, "Gap DB",
+            {"Name": {"title": {}},
+             "Stage": {"select": {"options": [{"name": "One", "color": "red"}]}},
+             "State": {"status": {}}},
+            is_inline=True,
+        )
+        assert db["is_inline"] is True
+        ds_id = db["data_sources"][0]["id"]
+
+        # recolour an existing option, matched case-insensitively
+        ds = client.update_data_source(ds_id, properties={
+            "Stage": {"select": {"options": [{"name": "one", "color": "blue"}]}},
+        })
+        assert ds["properties"]["Stage"]["select"]["options"][0]["color"] == "blue"
+
+        assert client.list_templates(ds_id) == []
+        second = client.create_data_source(db["id"], "Second", {"Name": {"title": {}}})
+        assert second["object"] == "data_source"
+
+        archived = client.query_data_source_page(ds_id, is_archived=True)
+        assert archived["results"] == []
+        grouped = client.query_data_source_page(ds_id, filter={
+            "property": "State", "status": {"group_equals": "To-do"},
+        })
+        assert grouped["object"] == "list"
+
+        typed = client.create_database(test_page, database_type="tasks")
+        assert typed["database_type"] == "tasks"
+
+    def test_small_read_endpoints(self, client, test_page):
+        me = client.get_user("me")
+        assert me["type"] == "bot"
+        assert isinstance(client.list_custom_emojis(), list)
+        assert "results" in client.list_file_uploads(page_size=1)
+        assert "results" in client.query_meeting_notes(limit=1)
+        c = client.create_comment(test_page, markdown="gap comment")
+        assert client.retrieve_comment(c["id"])["id"] == c["id"]

@@ -8,7 +8,7 @@ page icons/covers, multi-part upload for large files, and in-place PDF
 reading with optional OCR. Built on the
 [Python MCP SDK](https://github.com/modelcontextprotocol/python-sdk)
 (FastMCP); runs as a local stdio server or a containerized Streamable
-HTTP service with bearer auth. 44 tools.
+HTTP service with bearer auth. 55 tools.
 
 > Unofficial project, not affiliated with or endorsed by Notion.
 
@@ -28,7 +28,10 @@ HTTP service with bearer auth. 44 tools.
   - [File Downloads](#file-downloads)
   - [PDF Reading & OCR](#pdf-reading--ocr)
   - [Comments](#comments)
+  - [Views](#views)
   - [Users](#users)
+  - [Meeting Notes](#meeting-notes)
+  - [Custom Emojis & Upload Listing](#custom-emojis--upload-listing)
 - [Markdown Format](#markdown-format)
 - [Working with Databases](#working-with-databases)
 - [Working with Files](#working-with-files)
@@ -174,9 +177,20 @@ Create a new page with optional markdown body content.
 | `parent_page_id` | string | no | `""` | Create as child of this page |
 | `database_id` | string | no | `""` | Create as row in this database |
 | `properties_json` | string | no | `""` | JSON object of Notion property values |
-| `icon` | string | no | `""` | Emoji for page icon (e.g. `"🚀"`) |
+| `icon` | string | no | `""` | Page icon — see [icon values](#icon-values) |
+| `template` | string | no | `""` | Database rows: `"default"` or a template ID from `notion_list_templates`. The template supplies the body, so leave `content` empty |
+| `position` | string | no | `""` | Where the page lands among a parent *page's* children: `"start"`, `"end"`, or a block ID to insert after |
+| `silent` | bool | no | `false` | Skip the update, @mention and Person-property notifications this write would send |
+| `native_markdown` | bool | no | `false` | Send `content` to Notion's own markdown parser instead of converting it to blocks locally (Notion-specific markup; very large pages run as a background task) |
+| `markdown_version` | string | no | `""` | With `native_markdown`: `"v2"` opts into Notion-flavored Markdown (preview) |
 
 Provide either `parent_page_id` (standalone page) or `database_id` (database row). The title property name is auto-detected from the database schema.
+
+<a id="icon-values"></a>**Icon values** (`notion_create_page`, `notion_update_page`): an emoji (`"🚀"`), `"custom_emoji:<name-or-id>"` (names are resolved through `notion_list_custom_emojis`), `"icon:<name>[:<color>]"` for a native Notion icon (e.g. `"icon:pizza:blue"`), or an image URL. `notion_update_page` also takes `"remove"`.
+
+Wiki page verification is an ordinary property: `{"Verification": {"verification": {"state": "verified"}}}` in `properties_json`.
+
+With `native_markdown`, the request is sent with `allow_async`; the server waits for Notion's background task (up to ~150 s). If it is still running, the reply carries a task ID for `notion_get_async_task` — do not retry, or the page is created twice.
 
 For database rows, pass additional properties via `properties_json` using [Notion property value format](https://developers.notion.com/reference/property-value-object):
 ```json
@@ -189,20 +203,49 @@ For database rows, pass additional properties via `properties_json` using [Notio
 
 The `content` parameter accepts markdown which is parsed into Notion blocks (see [Markdown Format](#markdown-format)).
 
-> Notion API: [POST /pages](https://developers.notion.com/reference/post-page) with `children` blocks
+> Notion API: [POST /pages](https://developers.notion.com/reference/post-page) with `children` blocks, or `markdown` + `allow_async`; `template`, `position`, `notifications`
 
 #### `notion_append_content`
 
-Append markdown content to the end of an existing page.
+Add markdown content to an existing page.
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `page_id` | string | yes | The page to append to |
-| `content` | string | yes | Markdown text to append |
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `page_id` | string | yes | | The page (or any block that supports children) to add to |
+| `content` | string | yes | | Markdown text to add |
+| `position` | string | no | `"end"` | `"end"`, `"start"`, or a block ID to insert directly after |
+| `silent` | bool | no | `false` | Skip the notifications this write would send |
 
-Content is parsed into blocks and appended. Automatically batches in groups of 100 if the content produces more than 100 blocks (Notion API limit).
+Content is parsed into blocks locally. Automatically batches in groups of 100 if the content produces more than 100 blocks (Notion API limit); later batches follow the first, so a positioned insert stays in order.
 
 > Notion API: [PATCH /blocks/{id}/children](https://developers.notion.com/reference/patch-block-children)
+
+#### `notion_insert_page_content`
+
+Insert markdown using Notion's own parser — at the start, the end, or after a piece of existing text. Understands Notion-specific markup that `notion_append_content` does not.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `page_id` | string | yes | | The page to insert into |
+| `markdown` | string | yes | | Content to insert |
+| `position` | string | no | `"end"` | `"end"` or `"start"`; ignored when `after` is given |
+| `after` | string | no | `""` | Insert after this passage, given as `"start text...end text"` |
+
+> Notion API: [PATCH /pages/{id}/markdown](https://developers.notion.com/reference/update-page-markdown) with `type: "insert_content"`
+
+#### `notion_add_tabs`
+
+Add a tab block: a row of tabs, each with its own content.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `page_id` | string | yes | | The page (or child-bearing block) to add to |
+| `tabs_json` | string | yes | | JSON array of `{"label", "icon"?, "content"?}` — `icon` is an emoji, `content` is markdown |
+| `position` | string | no | `"end"` | `"end"`, `"start"`, or a block ID to insert after |
+
+Tabs are created first and their content appended in a second pass, so tab content may itself be nested.
+
+> Notion API: [Tab block](https://developers.notion.com/reference/block)
 
 ---
 
@@ -217,7 +260,8 @@ Update a page's title, icon, or database properties. Does not modify page body c
 | `page_id` | string | yes | | The page to update |
 | `title` | string | no | `""` | New title |
 | `properties_json` | string | no | `""` | JSON of properties to update |
-| `icon` | string | no | `""` | Emoji, or `"remove"` to clear |
+| `icon` | string | no | `""` | `"remove"` to clear, or any of the [icon values](#icon-values) |
+| `silent` | bool | no | `false` | Skip the notifications this write would send |
 
 For database row pages, properties follow the [Notion property value format](https://developers.notion.com/reference/property-value-object). Omitted properties are left unchanged.
 
@@ -232,8 +276,10 @@ Edit page body content using search-and-replace on the page's markdown. Use `not
 | `page_id` | string | yes | The page to edit |
 | `old_text` | string | yes | Exact text to find |
 | `new_text` | string | yes | Replacement text (empty string to delete) |
+| `replace_all` | bool | no | If `old_text` occurs more than once the edit is rejected unless this is `true` |
+| `allow_deleting_content` | bool | no | Must be `true` for an edit that would delete a child page or database |
 
-> Notion API: [PATCH /pages/{id}/markdown](https://developers.notion.com/reference/update-page-markdown) with `type: "replace_content_range"` (API 2025-09-03+)
+> Notion API: [PATCH /pages/{id}/markdown](https://developers.notion.com/reference/update-page-markdown) with `type: "update_content"` (the deprecated `replace_content_range` was used before 2026-10)
 
 #### `notion_replace_page_content`
 
@@ -243,8 +289,22 @@ Replace a page's entire body content with new markdown. Destructive — all exis
 |-----------|------|----------|-------------|
 | `page_id` | string | yes | The page to overwrite |
 | `markdown` | string | yes | New page content |
+| `allow_deleting_content` | bool | no | Must be `true` when the replacement would delete a child page or database |
+| `markdown_version` | string | no | `"v2"` treats `markdown` as Notion-flavored Markdown (preview) |
+
+Sent with `allow_async`: a very large page is processed as a background task, which the server waits for (up to ~150 s). If it is still running the reply carries a task ID.
 
 > Notion API: [PATCH /pages/{id}/markdown](https://developers.notion.com/reference/update-page-markdown) with `type: "replace_content"` (API 2025-09-03+)
+
+#### `notion_get_async_task`
+
+Check a background write that had not finished when the tool that started it returned.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `task_id` | string | yes | Task ID from that tool's reply |
+
+> Notion API: [GET /async_tasks/{id}](https://developers.notion.com/reference/retrieve-async-task)
 
 ---
 
@@ -332,13 +392,17 @@ Returns the `database_id`, `data_source_id`, and all properties with their types
 
 #### `notion_create_database`
 
-Create a new inline database under a page.
+Create a new database under a page — with your own schema, or one of Notion's typed databases.
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `parent_page_id` | string | yes | Page to create the database under |
-| `title` | string | yes | Database title |
-| `schema_json` | string | yes | JSON property schema |
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `parent_page_id` | string | yes | | Page to create the database under |
+| `title` | string | no | `""` | Database title (a typed database is otherwise named after its type) |
+| `schema_json` | string | no | `""` | JSON property schema |
+| `database_type` | string | no | `""` | `"tasks"`, `"projects"` or `"skills"`: Notion's built-in schema instead of `schema_json` |
+| `inline` | bool | no | `false` | Show the database inline on the parent page |
+
+Provide exactly one of `schema_json` and `database_type`.
 
 The `schema_json` maps property names to [Notion property schema objects](https://developers.notion.com/reference/property-schema-object). A title property is required:
 
@@ -398,6 +462,31 @@ Multiple changes can be combined in one call.
 
 ---
 
+#### `notion_add_data_source`
+
+Add another data source (a second table with its own schema) to an existing database. The other database tools operate on a database's first data source.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `database_id` | string | yes | The database to add to |
+| `title` | string | yes | Name of the new data source |
+| `schema_json` | string | yes | Property schema (same format as `notion_create_database`) |
+
+> Notion API: [POST /data_sources](https://developers.notion.com/reference/create-a-data-source)
+
+#### `notion_list_templates`
+
+List the page templates defined on a database. Pass a template ID (or `"default"`) as `notion_create_page`'s `template`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `database_id` | string | yes | The database to inspect |
+| `name` | string | no | Case-insensitive substring filter |
+
+> Notion API: [GET /data_sources/{id}/templates](https://developers.notion.com/reference/list-data-source-templates)
+
+---
+
 ### Database Queries
 
 #### `notion_query_database`
@@ -411,6 +500,7 @@ Query database rows with optional filter and sort.
 | `sorts_json` | string | no | `""` | [Notion sort array](https://developers.notion.com/reference/post-database-query-sort) as JSON |
 | `limit` | int | no | 50 | Page size (1-100 — Notion's hard cap) |
 | `start_cursor` | string | no | `""` | Opaque cursor from a previous call. Pass it back to fetch the next page. |
+| `archived` | bool | no | `false` | Return the database's archived rows instead of the active ones |
 | `properties` | string | no | `""` | Comma-separated property names to include in the output (e.g. `"Gmail Message ID, Invoice, Status"`). The title column is always shown. Unknown names are ignored silently. Dramatically slims output when you only need a few columns. |
 
 **Filter examples:**
@@ -502,6 +592,7 @@ Upload a file and attach it to a page as a new block.
 | `filename` | string | no | `""` | Override the source filename |
 | `caption` | string | no | `""` | Caption shown below the file in Notion |
 | `position` | string | no | `"end"` | Where the new block lands: `"end"`, `"start"`, or a block ID to insert directly after that block |
+| `embed_html` | bool | no | `false` | Attach an `.html`/`.htm` file as an embed block that Notion renders in the page, instead of a downloadable file block |
 
 The `source` parameter accepts four schemes:
 - `local:<path>` — file from the server's local store (`/data/files`)
@@ -734,6 +825,16 @@ Returns comment text, author name, timestamp, and `discussion_id` for threading.
 
 > Notion API: [GET /comments](https://developers.notion.com/reference/retrieve-a-comment) with `block_id` parameter
 
+#### `notion_get_comment`
+
+Get a single comment by ID (text, author, timestamps, discussion thread).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `comment_id` | string | yes | From `notion_get_comments` or `notion_add_comment` |
+
+> Notion API: [GET /comments/{id}](https://developers.notion.com/reference/retrieve-comment)
+
 #### `notion_add_comment`
 
 Add a comment to a page, or reply to an existing discussion thread.
@@ -826,6 +927,10 @@ same cache the query path uses. Deleting a view never touches rows.
 
 List all workspace users (people and bots).
 
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name_contains` | string | no | Case-insensitive filter on the user's name |
+
 Returns names, IDs, emails, and types. User IDs are needed for `people` properties and `@mentions` in comments.
 
 > Notion API: [GET /users](https://developers.notion.com/reference/get-users) (paginated)
@@ -836,11 +941,65 @@ Get details for a specific user.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `user_id` | string | yes | Notion user UUID |
+| `user_id` | string | yes | Notion user UUID, or `"me"` for this integration's own bot user |
 
-Returns name, email, avatar URL, type (person/bot), and owner info for bots.
+Returns name, email, avatar URL, type (person/bot), and owner info for bots. `"me"` also shows the connected workspace and its file-upload size limit.
 
-> Notion API: [GET /users/{id}](https://developers.notion.com/reference/get-user)
+> Notion API: [GET /users/{id}](https://developers.notion.com/reference/get-user), [GET /users/me](https://developers.notion.com/reference/get-self)
+
+---
+
+### Meeting Notes
+
+Notion AI meeting notes. They need AI meeting notes on the integration's workspace; without it the API returns 400.
+
+#### `notion_query_meeting_notes`
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `title_contains` | string | no | `""` | Simple title filter |
+| `filter_json` | string | no | `""` | Full meeting-notes filter; overrides `title_contains` |
+| `sort_json` | string | no | `""` | Sort array (default: newest first) |
+| `limit` | int | no | 10 | 1-50; the API has no paging here |
+
+> Notion API: [POST /blocks/meeting_notes/query](https://developers.notion.com/reference/query-meeting-notes)
+
+#### `notion_read_meeting_notes`
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `block_id` | string | yes | | Meeting notes block ID |
+| `section` | string | no | `"summary"` | `"summary"`, `"notes"` or `"transcript"` |
+
+#### `notion_create_meeting_notes`
+
+Create a transcript and summary from a recording. **Not idempotent** — a second call creates a second set of notes, so the server never retries it. Processing continues after the call returns.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `source` | string | yes | | An audio/video file (`shared:`, `local:`, `drive:`) or `notion:<block_id>` for an audio block already on a page |
+| `parent_page_id` | string | for files | `""` | Page the notes are added to |
+| `title` | string | no | `""` | Meeting title |
+| `language` | string | no | `""` | Transcription hint, e.g. `"en"` |
+| `summarize` | bool | no | `true` | `false` transcribes without a summary |
+
+> Notion API: [POST /blocks/meeting_notes](https://developers.notion.com/reference/create-meeting-note)
+
+---
+
+### Custom Emojis & Upload Listing
+
+#### `notion_list_custom_emojis`
+
+List workspace custom emojis; optional exact `name` filter. Use one as an icon with `"custom_emoji:<name>"`.
+
+> Notion API: [GET /custom_emojis](https://developers.notion.com/reference/list-custom-emojis)
+
+#### `notion_list_file_uploads`
+
+List files this integration has uploaded, with status. `status` filters to `pending`, `uploaded`, `expired` or `failed`; `limit` 1-100.
+
+> Notion API: [GET /file_uploads](https://developers.notion.com/reference/list-file-uploads)
 
 ---
 
@@ -886,6 +1045,8 @@ Inline formatting within any block:
 - Images (`![caption](url)`), files, bookmarks, embeds
 - Tables (rendered as markdown tables)
 - Child pages and databases (shown as `[Page: Title]` / `[Database: Title]`)
+- Tab blocks (each tab as `**[Tab: label]**` followed by its content)
+- Meeting notes (shown as `[Meeting notes: Title] (status)` with the block ID for `notion_read_meeting_notes`)
 - Nested blocks (indented, recursive up to `max_depth`)
 
 ---
@@ -1026,7 +1187,14 @@ and gmail's `list_shared_files` include it per file too).
 
 ### Google Drive Integration
 
-The Drive integration is an **optional companion feature**: it reuses OAuth refresh tokens from [google-accounts-mcp](https://github.com/snickery/google-accounts-mcp) (mounted read-only at `/google-data/tokens.db`) using the same Google client ID. Without that companion server, skip the Drive env vars — every other file source keeps working, and `drive:` sources return a clear setup error. Use `drive:` when you want the file to persist in Drive; use `shared:` when you just need a one-shot handoff between the two MCP servers.
+The Drive integration is **optional**. Without it, skip the Drive env vars — every other file source keeps working, and `drive:` sources return a clear setup error. Use `drive:` when you want the file to persist in Drive; use `shared:` when you just need a one-shot handoff between the two MCP servers.
+
+Access tokens for `DRIVE_ACCOUNT` come from one of two places:
+
+- **Broker mode** (`GOOGLE_AUTH_URL` set): a google-auth token broker hands out short-lived access tokens over HTTP (`GET /token?account=`, authenticated with `GOOGLE_AUTH_BEARER`). notion-mcp then holds no OAuth client secret and no refresh token, and a re-authorised account is picked up without a restart. Broker failures surface as actionable tool errors (re-authorise the account, account not shared with this service, missing scope, broker unreachable). The client is a single vendored stdlib file, `broker_client.py` — no extra dependency.
+- **Local mode** (`GOOGLE_AUTH_URL` unset): reuse OAuth refresh tokens from [google-accounts-mcp](https://github.com/snickery/google-accounts-mcp)'s SQLite token DB (mounted read-only at `/google-data/tokens.db`) with the same Google client ID and secret. The refresh token is read once per process, so restart notion-mcp after re-authorising.
+
+Either way the token must come from the same OAuth client google-accounts-mcp uses: the `drive.file` scope only sees files that client created.
 
 ---
 
@@ -1101,10 +1269,12 @@ All config is via environment variables. For container deployment, put secrets i
 | `NOTION_API_VERSION` | No | `2026-03-11` | Notion API version header |
 | `PORT` | No | `8322` | Server listen port |
 | `FILES_DIR` | No | `/data/files` | Local file store path |
-| `GOOGLE_CLIENT_ID` | For Drive | | OAuth client ID (same as google-accounts-mcp) |
-| `GOOGLE_CLIENT_SECRET` | For Drive | | OAuth client secret |
-| `GOOGLE_TOKEN_DB_PATH` | For Drive | `/google-data/tokens.db` | Path to google-accounts-mcp's SQLite token DB (read-only; the legacy `GMAIL_TOKEN_DB_PATH` name is still honored) |
 | `DRIVE_ACCOUNT` | For Drive | | Google account email for Drive access |
+| `GOOGLE_AUTH_URL` | Drive, broker mode | | Base URL of a google-auth token broker (e.g. `http://google-auth:8335`). Setting it selects broker mode |
+| `GOOGLE_AUTH_BEARER` | Drive, broker mode | | This service's bearer token for the broker |
+| `GOOGLE_CLIENT_ID` | Drive, local mode | | OAuth client ID (same as google-accounts-mcp) |
+| `GOOGLE_CLIENT_SECRET` | Drive, local mode | | OAuth client secret |
+| `GOOGLE_TOKEN_DB_PATH` | Drive, local mode | `/google-data/tokens.db` | Path to google-accounts-mcp's SQLite token DB (read-only; the legacy `GMAIL_TOKEN_DB_PATH` name is still honored) |
 | `DRIVE_FOLDER_NAME` | For Drive | `mcp-google-accounts` | Shared Drive folder name |
 
 ## Architecture
@@ -1114,7 +1284,8 @@ src/notion_mcp/
   server.py          # FastMCP tool definitions, HTTP server, bearer auth middleware
   notion_client.py   # Notion REST client — all API calls, pagination, caching
   blocks.py          # Bidirectional Notion blocks <-> markdown conversion
-  drive_client.py    # Google Drive client (reuses google-accounts-mcp OAuth tokens)
+  drive_client.py    # Google Drive client (token broker, or google-accounts-mcp's token DB)
+  broker_client.py   # google-auth token broker client (vendored verbatim, stdlib only)
   config.py          # Environment variable configuration
 ```
 
@@ -1148,19 +1319,20 @@ NOTION_TEST_TOKEN=ntn_... uv run --extra test pytest -v
 
 ## Testing
 
-### Unit Tests (203 tests, ~2s)
+### Unit Tests (294 tests, ~2s)
 
 No API access required. Seven test files (the PDF-tool tests mock the
 xberg HTTP calls — no network):
 
-**`test_blocks.py`** (77 tests) — markdown conversion:
+**`test_blocks.py`** (83 tests) — markdown conversion:
 - `rich_text_to_md` / `md_to_rich_text`: all inline formatting variants
 - `blocks_to_markdown`: every block type, nesting, `include_block_ids`, tables
 - `markdown_to_blocks`: headings, lists, quotes, code, dividers, mixed content
 - `format_property_value`: all 20+ Notion property types
 - `format_page_properties`: multi-property formatting
 
-**`test_notion_client.py`** (50 tests) — client logic with mocked HTTP:
+**`test_notion_client.py`** (95 tests) — client logic with mocked HTTP:
+- Async-task polling, silent notifications, templates, typed databases, positioned appends, status-group beta header, body `retry_after`
 - Pagination for `list_children`, `query_data_source`, `list_comments`, `list_users`
 - `resolve_data_source_id` caching and error handling
 - `create_page` child batching (>100 blocks)
@@ -1168,8 +1340,9 @@ xberg HTTP calls — no network):
 - `pick_block_type` MIME mapping
 - `find_title_property` / `get_page_title` edge cases
 
-**`test_server_tools.py`** (38 tests) — tool-layer logic with a mocked client
-(file source resolution, positional inserts, replace flows, purge tools).
+**`test_server_tools.py`** (69 tests) — tool-layer logic with a mocked client
+(file source resolution, positional inserts, replace flows, purge tools, icon
+values, tabs, meeting notes, HTML embeds).
 
 **`test_sources.py`** (13 tests) — `_read_source` scheme parsing for
 `local:`/`shared:`/`base64:` (the `drive:` scheme lives in `test_drive_client.py`).
@@ -1182,14 +1355,15 @@ base64 return modes, OCR plumbing (xberg calls mocked; full OCR-tier
 semantics are covered in google-accounts-mcp's `test_pdf_read.py`, since
 `pdf_read.py` is duplicated verbatim across the two repos).
 
-**`test_drive_client.py`** (3 tests) — Drive client; guards the read-only
-tokens-DB regression (sqlite must open with `immutable=1`).
+**`test_drive_client.py`** (13 tests) — Drive client; guards the read-only
+tokens-DB regression (sqlite must open with `immutable=1`) and covers broker
+mode (credential refresh, cache bypass after a 401, error mapping).
 
 ```bash
 uv run --extra test pytest tests/ --ignore=tests/test_integration.py -v
 ```
 
-### Integration Tests (17 tests, ~60s)
+### Integration Tests (26 tests, ~70s)
 
 Hit the live Notion API against a sandbox page you provide. Require:
 - `NOTION_TEST_TOKEN` — an integration token with access to the sandbox
@@ -1204,6 +1378,10 @@ Tests create pages, exercise all endpoints, and clean up after themselves:
 - Data sources (resolve, get schema, query, search)
 - Move page (create parent A/B, move child, verify)
 - Comments (create, list)
+- Views (lifecycle, query)
+- 2026-10 additions: native-markdown create, markdown insert/update/replace, positioned and silent writes, tabs, HTML embeds, typed databases, second data sources, templates, archived and status-group queries, the small read endpoints
+
+Not exercised live: `notion_create_meeting_notes` (it needs a real recording and spends Notion AI) and template-based page creation (the sandbox database has no templates).
 
 ```bash
 NOTION_TEST_TOKEN=ntn_... uv run --extra test pytest tests/test_integration.py -v
@@ -1267,8 +1445,9 @@ register with:
 `notion_mcp.healthcheck` does a full HTTP round-trip to `/mcp` (the 401
 counts as alive); wire it to your container healthcheck. Terminate TLS at
 a reverse proxy — the server itself speaks plain HTTP. For the optional
-Drive/shared-mount features, add the `/google-data` (read-only) and
-`/shared` mounts shared with a google-accounts-mcp container.
+shared-mount feature, add the `/shared` mount shared with a
+google-accounts-mcp container; for Drive in local mode, also mount its
+token DB read-only at `/google-data` (broker mode needs no mount).
 
 ## Notion API Version Notes
 
@@ -1294,6 +1473,23 @@ This server uses Notion API **2026-03-11**. Version history:
 | Transcription block type | `"transcription"` | `"meeting_notes"` |
 
 The `position` object also supports `{"type": "start"}` and `{"type": "end"}` for inserting at the beginning or end of a parent block.
+
+### Additions within 2026-03-11
+
+Notion keeps adding to this version without a new version string. Adopted so far:
+
+| Added | Feature | Where |
+|-------|---------|-------|
+| 2026-03 | Views API, `heading_4`, tab blocks, custom emoji list, native icons | view tools, `notion_add_tabs`, `notion_list_custom_emojis`, icon values |
+| 2026-04 | Comment update/delete, markdown comments | comment tools |
+| 2026-05 | Markdown `insert_content.position`, meeting-notes query | `notion_insert_page_content`, `notion_query_meeting_notes` |
+| 2026-06 | `allow_async` + async tasks, 529 retry | `native_markdown`, `notion_replace_page_content`, `notion_get_async_task` |
+| 2026-07 | `filter.in_trash`, `is_archived`, HTML embeds | `notion_search_pages`, `notion_query_database(archived)`, `notion_upload_file(embed_html)` |
+| 2026-08 | Create meeting notes | `notion_create_meeting_notes` |
+| 2026-09 | `database_type`, body `retry_after`, `markdown_version` (preview) | `notion_create_database`, retries, markdown tools |
+| 2026-10 | `notifications.mode: silent`, option recolouring, status-group filters (beta header sent automatically) | `silent`, `notion_update_database`, `notion_query_database` |
+
+Not implemented by design: webhooks, OAuth token endpoints, the Admin API and the Notion Agent APIs (this server uses one internal integration token and has no event receiver), and `filter_properties` on page writes (it only trims a response the tools do not return).
 
 The server handles the data source migration transparently — you always pass `database_id` and the server resolves the `data_source_id` internally (with caching).
 

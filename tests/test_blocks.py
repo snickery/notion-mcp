@@ -3,7 +3,6 @@
 Pure unit tests, no API calls or mocking needed.
 """
 
-import pytest
 
 from notion_mcp.blocks import (
     blocks_to_markdown,
@@ -14,7 +13,6 @@ from notion_mcp.blocks import (
     rich_text_to_md,
 )
 from tests.conftest import _rt, make_block
-
 
 # ===================================================================
 # rich_text_to_md
@@ -464,3 +462,51 @@ class TestHeading4:
             "heading_4": {"rich_text": [{"plain_text": "Deep", "annotations": {}}]},
         }
         assert blocks_to_markdown([block]).startswith("#### Deep")
+
+
+# ===================================================================
+# tab + meeting_notes rendering (2026-10)
+# ===================================================================
+
+class TestTabAndMeetingNotesRendering:
+    def _tab(self):
+        def para(pid, text, icon=None, children=None):
+            payload = {"rich_text": [{"type": "text", "plain_text": text,
+                                      "text": {"content": text}}]}
+            if icon:
+                payload["icon"] = {"type": "emoji", "emoji": icon}
+            b = {"id": pid, "type": "paragraph", "paragraph": payload}
+            if children:
+                b["_children"] = children
+            return b
+        return {
+            "id": "tab-1", "type": "tab", "tab": {}, "has_children": True,
+            "_children": [
+                para("i-a", "Overview", "📋", [para("c-1", "inside A")]),
+                para("i-b", "Details"),
+            ],
+        }
+
+    def test_tab_labels_and_content(self):
+        from notion_mcp.blocks import blocks_to_markdown
+        md = blocks_to_markdown([self._tab()])
+        assert "**[Tab: 📋 Overview]**" in md
+        assert "**[Tab: Details]**" in md
+        assert "inside A" in md
+        assert md.index("Overview") < md.index("inside A") < md.index("Details")
+
+    def test_tab_item_ids_when_requested(self):
+        from notion_mcp.blocks import blocks_to_markdown
+        md = blocks_to_markdown([self._tab()], include_ids=True)
+        assert "<!-- block:i-a -->" in md and "<!-- block:c-1 -->" in md
+
+    def test_meeting_notes_points_at_reader(self):
+        from notion_mcp.blocks import blocks_to_markdown
+        md = blocks_to_markdown([{
+            "id": "mn-1", "type": "meeting_notes",
+            "meeting_notes": {"title": [{"type": "text", "plain_text": "Sync",
+                                         "text": {"content": "Sync"}}],
+                              "status": "notes_ready"},
+        }])
+        assert "[Meeting notes: Sync] (notes_ready)" in md
+        assert "mn-1" in md and "notion_read_meeting_notes" in md

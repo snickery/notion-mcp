@@ -7,12 +7,20 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_API_VERSION = os.environ.get("NOTION_API_VERSION", "2026-03-11")
 NOTION_API_BASE = "https://api.notion.com/v1"
 
-# --- Google Drive (optional companion-server feature) ---------------------
-# The drive: scheme reuses refresh tokens from the companion
-# google-accounts-mcp server (formerly gmail-mcp), which stores them in a
-# sqlite DB keyed by email. We mount that directory read-only and open the
-# DB in read-only mode to mint short-lived Drive access tokens without ever
-# writing back. Skip all GMAIL_/DRIVE_/GOOGLE_ vars to run without Drive.
+# --- Google Drive (optional feature) --------------------------------------
+# Two ways to get a Drive access token for DRIVE_ACCOUNT:
+#
+# 1. Broker mode (GOOGLE_AUTH_URL set): ask a google-auth token broker
+#    over HTTP. This server then holds no OAuth client secret and no
+#    refresh token, and a re-authorised account is picked up without a
+#    restart.
+# 2. Local mode (GOOGLE_AUTH_URL unset): read the refresh token from the
+#    companion google-accounts-mcp server's sqlite token DB (opened
+#    read-only, never written back) and exchange it with GOOGLE_CLIENT_*.
+#
+# Skip all DRIVE_/GOOGLE_ vars to run without Drive.
+GOOGLE_AUTH_URL = os.environ.get("GOOGLE_AUTH_URL", "").rstrip("/")
+GOOGLE_AUTH_BEARER = os.environ.get("GOOGLE_AUTH_BEARER", "")
 GOOGLE_TOKEN_DB_PATH = (
     os.environ.get("GOOGLE_TOKEN_DB_PATH")
     or os.environ.get("GMAIL_TOKEN_DB_PATH")  # legacy name, still honored

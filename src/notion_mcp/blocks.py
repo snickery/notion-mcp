@@ -7,7 +7,6 @@ Property formatting: renders Notion property values as readable strings.
 
 import re
 
-
 # ---------------------------------------------------------------------------
 # Rich text <-> Markdown
 # ---------------------------------------------------------------------------
@@ -286,6 +285,31 @@ def blocks_to_markdown(
         elif btype == "synced_block":
             if children:
                 lines.append(blocks_to_markdown(children, indent, include_ids))
+
+        elif btype == "tab":
+            # Each direct child is a paragraph: its text is the tab label,
+            # its children the tab's content.
+            for tab in children:
+                tab_payload = tab.get("paragraph", {})
+                label = rich_text_to_md(tab_payload.get("rich_text", []))
+                emoji = (tab_payload.get("icon") or {}).get("emoji", "")
+                shown = f"{emoji} {label}" if emoji else label
+                lines.append(f"{prefix}**[Tab: {shown}]**{_tag(tab)}")
+                tab_children = tab.get("_children", [])
+                if tab_children:
+                    lines.append(
+                        blocks_to_markdown(tab_children, indent + 1, include_ids)
+                    )
+            lines.append("")
+
+        elif btype == "meeting_notes":
+            title = rich_text_to_md(payload.get("title", [])) or "(untitled)"
+            status = payload.get("status", "")
+            lines.append(
+                f"{prefix}[Meeting notes: {title}] ({status}) "
+                f"(id: {block['id']} — read with notion_read_meeting_notes)"
+            )
+            lines.append("")
 
         else:
             text = rich_text_to_md(payload.get("rich_text", []))

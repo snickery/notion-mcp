@@ -1,22 +1,20 @@
 import base64
 import concurrent.futures
-import functools
 import hashlib
-import hmac
-import inspect
 import json
 import logging
 import mimetypes
 import os
+import re
 import threading
-import time
 from pathlib import Path
 
-import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
+from mcp_server_kit import offload_sync_tools, serve
+from mcp_server_kit import pdf as pdf_read
+from mcp_server_kit.files import atomic_create as _atomic_create
 
-from notion_mcp import pdf_read
 from notion_mcp.blocks import (
     blocks_to_markdown,
     format_page_properties,
@@ -27,8 +25,6 @@ from notion_mcp.blocks import (
 from notion_mcp.config import FILES_DIR, MCP_BEARER_TOKEN, PORT, SHARED_DIR
 from notion_mcp.drive_client import DriveClient
 from notion_mcp.notion_client import NotionClient, pick_block_type
-
-logger = logging.getLogger(__name__)
 
 INSTRUCTIONS = """\
 Notion workspace server (pages, databases, blocks, comments, files).
@@ -50,7 +46,16 @@ notion_extract_file_text(source='notion:<block_id>') gets the text
 (scanned/image-only pages are OCR'd automatically; ocr='llm' routes
 hard documents to a vision model), and notion_render_file_page returns
 a viewable image of any page. Both accept notion:/shared:/local:/drive:
-sources."""
+sources.
+Writing: notion_append_content / notion_create_page convert markdown to
+blocks locally; notion_insert_page_content, notion_replace_page_content
+and notion_create_page(native_markdown=True) use Notion's own parser
+(tables, callouts, columns, mentions). Pass silent=True on page writes
+to avoid notifying people. A large native write may return a task ID —
+check it with notion_get_async_task, never retry it blind.
+Database rows can start from a template (notion_list_templates →
+notion_create_page(template=...)). AI meeting notes:
+notion_query_meeting_notes → notion_read_meeting_notes."""
 
 mcp = FastMCP(
     "notion",
@@ -60,122 +65,9 @@ mcp = FastMCP(
     stateless_http=True,
     json_response=True,
 )
+offload_sync_tools(mcp, logger_name="notion_mcp.requests")
 notion = NotionClient()
 drive = DriveClient()
-
-
-# --- Run blocking tool handlers off the event loop -----------------------
-# The MCP SDK executes a synchronous @mcp.tool function INLINE on the single
-# asyncio event loop (func_metadata.call_fn_with_arg_validation: the sync
-# branch is just `return fn(...)`). Every tool here makes a blocking upstream
-# call (httpx.Client requests, plus rate-limit backoff sleeps), so one slow
-# call would freeze the loop and stall ALL other requests — creates AND reads
-# alike — until it returns, surfacing as the client's 4-minute "MCP server
-# unresponsive" timeout.
-#
-# Wrapping mcp.tool makes each *sync* tool run in a worker thread via
-# anyio.to_thread.run_sync, keeping the loop free for concurrent requests.
-# functools.wraps + an explicit __signature__ preserve the introspected
-# signature, so the generated tool schema is byte-for-byte unchanged (clients
-# need no restart). Each call also emits a structured one-line log
-# (tool / duration / outcome) for Loki/Grafana so the next stall is visible.
-#
-# Dedicated request logger: plain single-line output (bypasses FastMCP's
-# RichHandler, which wraps lines and would split duration_ms onto a
-# continuation line, breaking Loki field extraction). propagate=False keeps
-# it off the root handler so the line is emitted exactly once.
-req_logger = logging.getLogger("notion_mcp.requests")
-if not req_logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    req_logger.addHandler(_h)
-    req_logger.setLevel(logging.INFO)
-    req_logger.propagate = False
-
-
-def _rss_mib() -> int:
-    """Current process RSS in MiB, read cheaply from /proc (no psutil dep) —
-    lets Grafana correlate a hang/OOM with the request that triggered it."""
-    try:
-        with open("/proc/self/statm") as f:
-            pages = int(f.read().split()[1])
-        return pages * (os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf")
-                        else 4096) // (1024 * 1024)
-    except Exception:
-        return -1
-
-
-_orig_tool = mcp.tool
-
-
-def _threaded_tool(*d_args, **d_kwargs):
-    register = _orig_tool(*d_args, **d_kwargs)
-
-    def decorator(fn):
-        if inspect.iscoroutinefunction(fn):
-            return register(fn)
-
-        @functools.wraps(fn)
-        async def wrapper(*args, **kwargs):
-            start = time.perf_counter()
-            outcome = "ok"
-            try:
-                return await anyio.to_thread.run_sync(
-                    functools.partial(fn, *args, **kwargs)
-                )
-            except Exception:
-                outcome = "error"
-                raise
-            finally:
-                req_logger.info(
-                    "tool=%s outcome=%s duration_ms=%d rss_mib=%d",
-                    fn.__name__, outcome,
-                    int((time.perf_counter() - start) * 1000),
-                    _rss_mib(),
-                )
-
-        wrapper.__signature__ = inspect.signature(fn)
-        # Register the threaded wrapper with FastMCP (the runtime calls this),
-        # but return the ORIGINAL sync fn so the module-level name stays
-        # directly callable — tool-to-tool calls and the unit tests invoke
-        # these functions synchronously and must not get a coroutine.
-        register(wrapper)
-        return fn
-
-    return decorator
-
-
-mcp.tool = _threaded_tool
-
-
-class BearerAuthMiddleware:
-    """Pure ASGI middleware — compatible with SSE streaming."""
-
-    def __init__(self, app, expected_token: str):
-        self.app = app
-        self.expected_token = expected_token
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] in ("http", "websocket"):
-            path = scope.get("path", "")
-            if path.startswith("/.well-known/"):
-                return await self.app(scope, receive, send)
-            headers = dict(scope.get("headers", []))
-            auth = headers.get(b"authorization", b"").decode()
-            if auth.startswith("Bearer "):
-                token = auth[7:]
-                if hmac.compare_digest(token, self.expected_token):
-                    return await self.app(scope, receive, send)
-            client_host = scope.get("client", ("unknown",))[0]
-            logger.warning("Rejected request: invalid bearer from %s", client_host)
-            body = json.dumps({"error": "unauthorized"}).encode()
-            await send({"type": "http.response.start", "status": 401, "headers": [
-                [b"content-type", b"application/json"],
-                [b"content-length", str(len(body)).encode()],
-            ]})
-            await send({"type": "http.response.body", "body": body})
-            return
-        await self.app(scope, receive, send)
 
 
 def _safe_path_under(root_str: str, filename: str) -> Path:
@@ -200,36 +92,6 @@ def _safe_shared_path(filename: str) -> Path:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def _atomic_create(root: Path, filename: str, data: bytes) -> Path:
-    """Create ``filename`` under ``root`` without overwriting: on collision
-    auto-rename with -2, -3, ... before the extension. Atomic
-    (O_CREAT|O_EXCL) so parallel writers do not clobber each other — same
-    semantics as google-accounts-mcp's shared-mount writes, so the two servers
-    behave identically. Callers must pass a bare filename."""
-    stem, ext = os.path.splitext(filename)
-    root.mkdir(parents=True, exist_ok=True)
-    for i in range(0, 1001):
-        candidate = root / (filename if i == 0 else f"{stem}-{i + 1}{ext}")
-        try:
-            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            continue
-        try:
-            with os.fdopen(fd, "wb") as fp:
-                fp.write(data)
-        except Exception:
-            try:
-                candidate.unlink()
-            except FileNotFoundError:
-                pass
-            raise
-        return candidate
-    raise RuntimeError(
-        f"Could not find a free filename for '{filename}' in {root} "
-        f"(tried up to -1000)."
-    )
 
 
 def _read_source(source: str, filename: str = "") -> tuple[bytes, str, str]:
@@ -336,6 +198,54 @@ def _new_block_id(api_response: dict) -> str:
     response."""
     results = api_response.get("results", [])
     return results[0].get("id", "(unknown)") if results else "(unknown)"
+
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$", re.IGNORECASE
+)
+
+
+def _icon_param(icon: str) -> dict | None:
+    """Map the LLM-friendly icon string to the API's icon object.
+
+    'remove' → None (clears it); 'custom_emoji:<name-or-id>' → a workspace
+    custom emoji (names are resolved via the custom-emoji list);
+    'icon:<name>[:<color>]' → a native Notion icon; an http(s) URL → an
+    external image; anything else is taken as an emoji character."""
+    icon = icon.strip()
+    if icon == "remove":
+        return None
+    if icon.startswith("custom_emoji:"):
+        ref = icon.split(":", 1)[1].strip().strip(":")
+        if not _UUID_RE.match(ref):
+            matches = notion.list_custom_emojis(name=ref)
+            if not matches:
+                raise ValueError(
+                    f"No custom emoji named '{ref}'. See notion_list_custom_emojis."
+                )
+            ref = matches[0]["id"]
+        return {"type": "custom_emoji", "custom_emoji": {"id": ref}}
+    if icon.startswith("icon:"):
+        name, _, color = icon.split(":", 1)[1].partition(":")
+        native: dict = {"name": name.strip()}
+        if color.strip():
+            native["color"] = color.strip()
+        return {"type": "icon", "icon": native}
+    if icon.startswith(("http://", "https://")):
+        return {"type": "external", "external": {"url": icon}}
+    return {"type": "emoji", "emoji": icon}
+
+
+def _pending_task_note(res: dict) -> str:
+    """Text for a write whose async task was still running at the wait
+    limit, or '' when the write finished."""
+    if res.get("object") != "async_task":
+        return ""
+    return (
+        f"Notion is still processing this write (task {res.get('id')}, "
+        f"status {res.get('status')}). Check it with "
+        f"notion_get_async_task before retrying — a retry would duplicate it."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +446,7 @@ def notion_upload_file(
     filename: str = "",
     caption: str = "",
     position: str = "end",
+    embed_html: bool = False,
 ) -> str:
     """Upload a file to Notion and attach it as a new block.
 
@@ -566,6 +477,10 @@ def notion_upload_file(
     via Notion's multi-part protocol automatically. To swap the file in an
     existing block without moving it, use notion_replace_file instead.
 
+    embed_html=True attaches an .html/.htm file as an embed block that
+    Notion renders in the page, instead of a downloadable file block
+    (caption is not applied to embeds).
+
     ## Cross-MCP file transfer
     To upload a Gmail attachment to a Notion page:
       1. google-accounts-mcp download_attachment(..., destination='shared')
@@ -573,12 +488,22 @@ def notion_upload_file(
     Files never traverse MCP parameters — no size limits.
     """
     data, name, mime = _read_source(source, filename)
-    block_type = pick_block_type(mime)
-    upload_id = _upload_bytes_to_notion(data, name, mime)
-    resp = notion.attach_file_to_page(
-        parent_page_id, upload_id, name, caption=caption,
-        block_type=block_type, position=_position_param(position),
-    )
+    if embed_html:
+        if not name.lower().endswith((".html", ".htm")):
+            raise ValueError("embed_html needs an .html or .htm file.")
+        mime = "text/html"
+        block_type = "embed"
+        upload_id = _upload_bytes_to_notion(data, name, mime)
+        resp = notion.attach_html_embed(
+            parent_page_id, upload_id, position=_position_param(position),
+        )
+    else:
+        block_type = pick_block_type(mime)
+        upload_id = _upload_bytes_to_notion(data, name, mime)
+        resp = notion.attach_file_to_page(
+            parent_page_id, upload_id, name, caption=caption,
+            block_type=block_type, position=_position_param(position),
+        )
 
     return (
         f"Uploaded to Notion:\n"
@@ -1395,6 +1320,11 @@ def notion_create_page(
     database_id: str = "",
     properties_json: str = "",
     icon: str = "",
+    template: str = "",
+    position: str = "",
+    silent: bool = False,
+    native_markdown: bool = False,
+    markdown_version: str = "",
 ) -> str:
     """Create a new Notion page with optional markdown content.
 
@@ -1408,14 +1338,29 @@ def notion_create_page(
     database_id:    ID of a database to add the row to.
     properties_json: JSON object of extra Notion properties (for database
                     rows). Keys are property names, values are Notion API
-                    property value objects.
-    icon:           emoji character for the page icon (e.g. "🚀").
+                    property value objects. A wiki page's verification is
+                    set here too: {"Verification": {"verification":
+                    {"state": "verified"}}}.
+    icon:           an emoji ("🚀"), "custom_emoji:<name-or-id>" (see
+                    notion_list_custom_emojis), "icon:<name>[:<color>]" for a
+                    native Notion icon (e.g. "icon:pizza:blue"), or an image URL.
+    template:       for database rows: "default" applies the database's
+                    default template, or pass a template ID from
+                    notion_list_templates. The template supplies the body,
+                    so leave content empty.
+    position:       where the page lands among a parent PAGE's children:
+                    "start", "end", or a block ID to insert after.
+    silent:         True skips the update, @mention and Person-property
+                    notifications this write would send.
+    native_markdown: True sends content to Notion's own markdown parser
+                    instead of converting it to blocks here. Use it for
+                    Notion-specific markup (tables, callouts, columns,
+                    toggles, mentions) and for very large pages, which
+                    Notion then processes as a background task.
+    markdown_version: with native_markdown, "v2" opts into Notion-flavored
+                    Markdown (a preview); default is the stable syntax.
     """
-    # Build properties
-    if properties_json:
-        properties = json.loads(properties_json)
-    else:
-        properties = {}
+    properties = json.loads(properties_json) if properties_json else {}
 
     # Set title — find the title property name or default to "title"
     if database_id and not any(
@@ -1429,15 +1374,39 @@ def notion_create_page(
     elif not database_id:
         properties["title"] = [{"text": {"content": title}}]
 
-    children = markdown_to_blocks(content) if content else None
+    template_obj = None
+    if template:
+        if content:
+            return "A template supplies the page body — leave content empty."
+        template_obj = (
+            {"type": "default"} if template.lower() == "default"
+            else {"type": "template_id", "template_id": template}
+        )
 
+    position_obj = None
+    if position.strip().lower() in ("start", "end"):
+        position_obj = {"type": f"page_{position.strip().lower()}"}
+    elif position.strip():
+        position_obj = {
+            "type": "after_block", "after_block": {"id": position.strip()},
+        }
+
+    use_native = native_markdown and bool(content)
     page = notion.create_page(
         properties=properties,
         parent_page_id=parent_page_id,
         database_id=database_id,
-        children=children,
-        icon=icon,
+        children=markdown_to_blocks(content) if content and not use_native else None,
+        icon=_icon_param(icon) if icon else "",
+        markdown=content if use_native else "",
+        markdown_version=markdown_version if use_native else "",
+        template=template_obj,
+        position=position_obj,
+        silent=silent,
     )
+    pending = _pending_task_note(page)
+    if pending:
+        return pending
     return (
         f"Created page:\n"
         f"  Title: {title}\n"
@@ -1452,6 +1421,7 @@ def notion_update_page(
     title: str = "",
     properties_json: str = "",
     icon: str = "",
+    silent: bool = False,
 ) -> str:
     """Update a Notion page's title, icon, or other properties.
 
@@ -1459,8 +1429,14 @@ def notion_update_page(
     title:           new title (leave empty to keep current).
     properties_json: JSON object of properties to update. Keys are property
                      names, values are Notion API property value objects.
-                     Omitted properties are left unchanged.
-    icon:            emoji for page icon, or "remove" to clear it.
+                     Omitted properties are left unchanged. Wiki
+                     verification is a property too: {"Verification":
+                     {"verification": {"state": "verified"}}}.
+    icon:            "remove" to clear it, or an emoji,
+                     "custom_emoji:<name-or-id>", "icon:<name>[:<color>]"
+                     (native Notion icon) or an image URL.
+    silent:          True skips the update, @mention and Person-property
+                     notifications this write would send.
     """
     props: dict = {}
     if properties_json:
@@ -1479,35 +1455,82 @@ def notion_update_page(
     body: dict = {}
     if props:
         body["properties"] = props
-    if icon == "remove":
-        body["icon"] = None
-    elif icon:
-        body["icon"] = {"type": "emoji", "emoji": icon}
+    if icon:
+        body["icon"] = _icon_param(icon)
 
     if not body:
         return "Nothing to update — provide title, properties_json, or icon."
 
-    notion._request("PATCH", f"/pages/{page_id}", json=body)
+    notion.update_page(page_id, body, silent=silent)
     return f"Updated page {page_id}."
 
 
 @mcp.tool()
-def notion_append_content(page_id: str, content: str) -> str:
-    """Append markdown content to an existing Notion page.
+def notion_append_content(
+    page_id: str, content: str, position: str = "end", silent: bool = False,
+) -> str:
+    """Add markdown content to an existing Notion page.
 
-    Parses the markdown into blocks and appends them to the end of the page.
+    Parses the markdown into blocks and adds them to the page.
     Supports: headings (# ## ###), bullet/numbered/to-do lists, quotes,
     fenced code blocks, dividers (---), paragraphs with inline formatting
     (**bold**, *italic*, `code`, ~~strike~~, [links](url)).
 
-    page_id: the page to append to.
-    content: markdown text to append.
+    page_id:  the page (or any block that supports children) to add to.
+    content:  markdown text to add.
+    position: 'end' (default), 'start', or a block ID to insert directly
+              AFTER that block (IDs from
+              notion_read_page(include_block_ids=True)).
+    silent:   True skips the notifications this write would send.
     """
     if not content.strip():
         return "No content to append."
     blocks = markdown_to_blocks(content)
-    added = notion.append_blocks(page_id, blocks)
+    added = notion.append_blocks(
+        page_id, blocks, position=_position_param(position), silent=silent,
+    )
     return f"Appended {len(added)} block(s) to page {page_id}."
+
+
+@mcp.tool()
+def notion_add_tabs(
+    page_id: str, tabs_json: str, position: str = "end",
+) -> str:
+    """Add a tab block (a row of tabs, each with its own content) to a page.
+
+    page_id:   the page (or any block that supports children) to add to.
+    tabs_json: JSON array, one object per tab:
+               [{"label": "Overview", "icon": "📋", "content": "markdown…"},
+                {"label": "Details", "content": "…"}]
+               label is required; icon (an emoji) and content are optional.
+    position:  'end' (default), 'start', or a block ID to insert after.
+    """
+    tabs = json.loads(tabs_json)
+    if not isinstance(tabs, list) or not tabs or not all(
+        isinstance(t, dict) and t.get("label") for t in tabs
+    ):
+        return "tabs_json must be a non-empty JSON array of {label, icon?, content?}."
+    labels = []
+    for t in tabs:
+        para: dict = {"rich_text": md_to_rich_text(t["label"])}
+        if t.get("icon"):
+            para["icon"] = {"emoji": t["icon"]}
+        labels.append({"type": "paragraph", "paragraph": para})
+    created = notion.append_blocks(
+        page_id, [{"type": "tab", "tab": {"children": labels}}],
+        position=_position_param(position),
+    )
+    tab_id = created[0]["id"]
+    # Content goes in a second pass: a single request cannot nest deeply
+    # enough for tab → label → content that itself has children.
+    tab_items = notion.list_children(tab_id)
+    for t, item in zip(tabs, tab_items):
+        if (t.get("content") or "").strip():
+            notion.append_blocks(item["id"], markdown_to_blocks(t["content"]))
+    return (
+        f"Added a tab block with {len(tabs)} tab(s) to {page_id}.\n"
+        f"  Block ID: {tab_id}"
+    )
 
 
 @mcp.tool()
@@ -1580,6 +1603,7 @@ def notion_query_database(
     limit: int = 50,
     start_cursor: str = "",
     properties: str = "",
+    archived: bool = False,
 ) -> str:
     """Query a Notion database with optional filter, sort, and pagination.
 
@@ -1594,6 +1618,9 @@ def notion_query_database(
           {"property": "Status", "select": {"equals": "Active"}},
           {"property": "Priority", "number": {"greater_than": 3}}
         ]}
+      Status properties can also be filtered by group (To-do / In
+      progress / Complete): {"property": "Status",
+        "status": {"group_equals": "In progress"}}
     sorts_json:  JSON array of sort objects. Example:
         [{"property": "Due", "direction": "ascending"}]
       Use "ascending" or "descending".
@@ -1607,6 +1634,8 @@ def notion_query_database(
       the output dramatically when you only need a few columns. The
       title column is always shown. Unknown names are ignored silently
       so a caller can ask for a union across a few databases.
+    archived: True returns the database's archived rows instead of the
+      active ones.
     """
     limit = max(1, min(100, limit))
     filter_obj = json.loads(filter_json) if filter_json else None
@@ -1623,6 +1652,7 @@ def notion_query_database(
         sorts=sorts_obj,
         page_size=limit,
         start_cursor=start_cursor,
+        is_archived=archived,
     )
     rows = envelope.get("results", [])
     next_cursor = envelope.get("next_cursor") or ""
@@ -1655,20 +1685,27 @@ def notion_query_database(
         lines.append(
             "  Pass next_cursor back as start_cursor to fetch the next page."
         )
+    if (envelope.get("request_status") or {}).get("type") == "incomplete":
+        lines.append(
+            "WARNING: Notion stopped this query at its 10,000-result limit — "
+            "rows beyond it are NOT included. Narrow the filter to see them."
+        )
     return "\n".join(lines)
 
 
 @mcp.tool()
 def notion_create_database(
     parent_page_id: str,
-    title: str,
-    schema_json: str,
+    title: str = "",
+    schema_json: str = "",
+    database_type: str = "",
+    inline: bool = False,
 ) -> str:
     """Create a new Notion database under a page.
 
-    parent_page_id: page to create the database under (it appears as an
-                    inline database on that page).
-    title:          database title.
+    parent_page_id: page to create the database under.
+    title:          database title (optional for a typed database, which
+                    is otherwise named after its type).
     schema_json:    JSON object mapping property names to their type config
                     in Notion API format. A title property is required.
                     Example:
@@ -1688,15 +1725,73 @@ def notion_create_database(
                       "Notes": {"rich_text": {}},
                       "Link": {"url": {}}
                     }
+    database_type:  "tasks", "projects" or "skills" creates one of Notion's
+                    typed databases with its built-in schema INSTEAD of
+                    schema_json (they cannot be combined). Run
+                    notion_describe_database afterwards for the exact
+                    property names.
+    inline:         True shows the database inline on the parent page;
+                    default is a full-page database.
     """
-    properties = json.loads(schema_json)
-    db = notion.create_database(parent_page_id, title, properties)
+    if bool(schema_json) == bool(database_type):
+        return "Provide exactly one of schema_json or database_type."
+    db = notion.create_database(
+        parent_page_id, title,
+        properties=json.loads(schema_json) if schema_json else None,
+        database_type=database_type, is_inline=inline,
+    )
+    shown = title or "".join(
+        t.get("plain_text", "") for t in db.get("title", [])
+    )
     return (
         f"Created database:\n"
-        f"  Title: {title}\n"
+        f"  Title: {shown}\n"
         f"  ID: {db['id']}\n"
         f"  URL: {db.get('url', '')}"
     )
+
+
+@mcp.tool()
+def notion_add_data_source(
+    database_id: str, title: str, schema_json: str,
+) -> str:
+    """Add another data source (a second table with its own schema) to an
+    existing database. Most databases have one; the other database tools
+    here operate on a database's FIRST data source.
+
+    database_id: the database to add to.
+    title:       name of the new data source.
+    schema_json: property schema, same format as notion_create_database
+                 (a title property is required).
+    """
+    ds = notion.create_data_source(database_id, title, json.loads(schema_json))
+    return (
+        f"Added data source:\n"
+        f"  Title: {title}\n"
+        f"  Data source ID: {ds['id']}\n"
+        f"  Database: {database_id}"
+    )
+
+
+@mcp.tool()
+def notion_list_templates(database_id: str, name: str = "") -> str:
+    """List the page templates defined on a database. Pass a template's ID
+    (or "default") as notion_create_page's template argument to create a
+    row from it.
+
+    database_id: the database to inspect.
+    name:        optional case-insensitive substring filter.
+    """
+    ds_id = notion.resolve_data_source_id(database_id)
+    templates = notion.list_templates(ds_id, name=name)
+    if not templates:
+        return f"No templates on database {database_id}."
+    lines = [f"{len(templates)} template(s) on database {database_id}:\n"]
+    for t in templates:
+        default = " (default)" if t.get("is_default") else ""
+        lines.append(f"  • {t.get('name', '(unnamed)')}{default}")
+        lines.append(f"      id: {t['id']}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -1719,6 +1814,8 @@ def notion_update_database(
       - Add select opts: {"Status": {"select": {"options": [
             {"name": "New Option", "color": "blue"}
         ]}}}
+      - Recolour an existing select / multi_select / status option: send
+        it by name with the new color (names match case-insensitively).
 
     Multiple changes can be combined in one call. Use
     notion_describe_database first to see current schema.
@@ -1811,6 +1908,27 @@ def notion_get_comments(page_id: str) -> str:
             lines.append(f"    discussion_id: {disc_id}")
         lines.append("")
     return "\n".join(lines)
+
+
+@mcp.tool()
+def notion_get_comment(comment_id: str) -> str:
+    """Get a single comment by ID — text, author, timestamps and the
+    discussion thread it belongs to.
+
+    comment_id: from notion_get_comments or notion_add_comment.
+    """
+    c = notion.retrieve_comment(comment_id)
+    text = "".join(rt.get("plain_text", "") for rt in c.get("rich_text", []))
+    parent = c.get("parent", {})
+    return (
+        f"Comment {c['id']}:\n"
+        f"  {text}\n"
+        f"  author: {c.get('created_by', {}).get('id', '')}\n"
+        f"  created: {c.get('created_time', '')}\n"
+        f"  edited: {c.get('last_edited_time', '')}\n"
+        f"  discussion_id: {c.get('discussion_id', '')}\n"
+        f"  parent: {parent.get(parent.get('type', ''), '')}"
+    )
 
 
 @mcp.tool()
@@ -1979,13 +2097,20 @@ def notion_delete_view(view_id: str) -> str:
 
 
 @mcp.tool()
-def notion_list_users() -> str:
+def notion_list_users(name_contains: str = "") -> str:
     """List all users in the Notion workspace.
 
     Returns user names, IDs, emails, and types (person or bot). User IDs
     are needed for people properties and @mentions in comments.
+
+    name_contains: optional case-insensitive filter on the user's name.
     """
     users = notion.list_users()
+    if name_contains:
+        users = [
+            u for u in users
+            if name_contains.lower() in (u.get("name") or "").lower()
+        ]
     if not users:
         return "No users found."
 
@@ -2014,7 +2139,8 @@ def notion_get_user(user_id: str) -> str:
     Returns the user's name, email, avatar URL, and type. Use
     notion_list_users to find user IDs first.
 
-    user_id: Notion user UUID.
+    user_id: Notion user UUID, or "me" for this integration's own bot
+             user (also shows the workspace it is connected to).
     """
     u = notion.get_user(user_id)
     name = u.get("name", "(unnamed)")
@@ -2025,8 +2151,15 @@ def notion_get_user(user_id: str) -> str:
         if person.get("email"):
             lines.append(f"  email: {person['email']}")
     elif utype == "bot":
-        owner = u.get("bot", {}).get("owner", {})
-        lines.append(f"  owner: {owner.get('type', 'unknown')}")
+        bot = u.get("bot", {})
+        lines.append(f"  owner: {bot.get('owner', {}).get('type', 'unknown')}")
+        if bot.get("workspace_name"):
+            lines.append(f"  workspace: {bot['workspace_name']}")
+        max_upload = (bot.get("workspace_limits") or {}).get(
+            "max_file_upload_size_in_bytes"
+        )
+        if max_upload:
+            lines.append(f"  max file upload: {max_upload} bytes")
     avatar = u.get("avatar_url")
     if avatar:
         lines.append(f"  avatar: {avatar}")
@@ -2039,7 +2172,7 @@ def notion_get_user(user_id: str) -> str:
 
 
 @mcp.tool()
-def notion_read_page_markdown(page_id: str) -> str:
+def notion_read_page_markdown(page_id: str, markdown_version: str = "") -> str:
     """Read a Notion page's content as native Notion-flavored markdown.
 
     Uses the direct markdown API endpoint — faster than block-by-block
@@ -2050,11 +2183,13 @@ def notion_read_page_markdown(page_id: str) -> str:
     notion_read_page with include_block_ids=True instead.
 
     page_id: Notion page ID.
+    markdown_version: "v2" returns Notion-flavored Markdown (a preview
+        syntax); default is the stable syntax.
     """
     page = notion.retrieve_page(page_id)
     title = notion.get_page_title(page)
     props = format_page_properties(page.get("properties", {}))
-    md = notion.get_page_markdown(page_id)
+    md = notion.get_page_markdown(page_id, markdown_version=markdown_version)
 
     parts = [f"# {title}", f"  id: {page_id}", f"  url: {page.get('url', '')}"]
     if props:
@@ -2071,6 +2206,8 @@ def notion_update_page_content(
     page_id: str,
     old_text: str,
     new_text: str,
+    replace_all: bool = False,
+    allow_deleting_content: bool = False,
 ) -> str:
     """Edit page content using search-and-replace on the page's markdown.
 
@@ -2081,13 +2218,54 @@ def notion_update_page_content(
     page_id:  the page to edit.
     old_text: exact text to find in the page content.
     new_text: replacement text (use empty string to delete).
+    replace_all: if old_text occurs more than once the edit is rejected
+              unless this is True (then every occurrence is replaced).
+    allow_deleting_content: must be True for an edit that would delete a
+              child page or database.
     """
-    notion.update_page_markdown(page_id, old_text, new_text)
+    notion.update_page_markdown(
+        page_id, old_text, new_text,
+        replace_all=replace_all, allow_deleting_content=allow_deleting_content,
+    )
     return f"Updated page content on {page_id}."
 
 
 @mcp.tool()
-def notion_replace_page_content(page_id: str, markdown: str) -> str:
+def notion_insert_page_content(
+    page_id: str, markdown: str, position: str = "end", after: str = "",
+) -> str:
+    """Insert markdown into a page using Notion's own markdown parser —
+    at the start, at the end, or after a piece of existing text.
+
+    Unlike notion_append_content (which converts markdown to blocks
+    locally), this understands Notion-specific markup (tables, callouts,
+    columns, toggles, mentions) and can target a spot by its text.
+
+    page_id:  the page to insert into.
+    markdown: content to insert.
+    position: "end" (default) or "start". Ignored when after is given.
+    after:    insert directly after this existing content, given as
+              "start text...end text" (the first and last few words of the
+              passage, joined by three dots). Copy them from
+              notion_read_page_markdown.
+    """
+    pos = position.strip().lower()
+    if not after and pos not in ("", "start", "end"):
+        return 'position must be "start" or "end" (or use after).'
+    notion.insert_page_markdown(
+        page_id, markdown, position="" if after else pos, after=after,
+    )
+    where = f"after '{after}'" if after else f"at the {pos or 'end'}"
+    return f"Inserted content {where} of page {page_id}."
+
+
+@mcp.tool()
+def notion_replace_page_content(
+    page_id: str,
+    markdown: str,
+    allow_deleting_content: bool = False,
+    markdown_version: str = "",
+) -> str:
     """Replace a page's entire content with new markdown.
 
     Overwrites all existing content. Use notion_read_page_markdown first
@@ -2096,9 +2274,48 @@ def notion_replace_page_content(page_id: str, markdown: str) -> str:
 
     page_id:  the page to replace content on.
     markdown: new page content in markdown format.
+    allow_deleting_content: must be True when the replacement would delete
+              a child page or database that is on the page now.
+    markdown_version: "v2" treats markdown as Notion-flavored Markdown (a
+              preview syntax); default is the stable syntax.
+
+    Very large pages are processed by Notion as a background task; if it
+    is still running when this returns, the reply carries a task ID for
+    notion_get_async_task.
     """
-    notion.replace_page_markdown(page_id, markdown)
-    return f"Replaced all content on page {page_id}."
+    res = notion.replace_page_markdown(
+        page_id, markdown,
+        allow_deleting_content=allow_deleting_content,
+        markdown_version=markdown_version,
+    )
+    return _pending_task_note(res) or f"Replaced all content on page {page_id}."
+
+
+@mcp.tool()
+def notion_get_async_task(task_id: str) -> str:
+    """Check a background write that Notion had not finished when the tool
+    that started it returned (large notion_create_page /
+    notion_replace_page_content calls report a task ID in that case).
+
+    task_id: the task ID from that reply.
+    """
+    t = notion.get_async_task(task_id)
+    status = t.get("status", "unknown")
+    op = (t.get("operation") or {}).get("name", "")
+    lines = [f"Task {task_id}: {status}", f"  operation: {op}"]
+    if status == "succeeded":
+        result = t.get("result") or {}
+        lines.append(f"  result: {result.get('object', '')} {result.get('id', '')}")
+        if result.get("url"):
+            lines.append(f"  url: {result['url']}")
+    elif status == "failed":
+        err = t.get("error") or {}
+        lines.append(f"  error: {err.get('code')}: {err.get('message')}")
+    else:
+        lines.append(
+            f"  still running — check again in {t.get('poll_after_seconds', 2)}s"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -2132,33 +2349,187 @@ def notion_move_page(
     return f"Moved page {page_id} to new parent {target}."
 
 
-def main():
-    import sys
+# ---------------------------------------------------------------------------
+# Meeting notes, custom emojis, file-upload listing
+# ---------------------------------------------------------------------------
 
+
+def _meeting_notes_lines(b: dict) -> list[str]:
+    mn = b.get("meeting_notes", {})
+    title = "".join(t.get("plain_text", "") for t in mn.get("title", []))
+    lines = [f"  • {title or '(untitled)'} [{mn.get('status', '?')}]",
+             f"      id: {b['id']}"]
+    start = (mn.get("calendar_event") or mn.get("recording") or {}).get("start_time")
+    lines.append(f"      when: {start or b.get('created_time', '')}")
+    attendees = (mn.get("calendar_event") or {}).get("attendees") or []
+    if attendees:
+        lines.append(f"      attendees: {len(attendees)}")
+    return lines
+
+
+@mcp.tool()
+def notion_query_meeting_notes(
+    title_contains: str = "",
+    filter_json: str = "",
+    sort_json: str = "",
+    limit: int = 10,
+) -> str:
+    """Find AI meeting notes in the workspace (newest first by default).
+    Read one with notion_read_meeting_notes.
+
+    title_contains: simple filter on the meeting title.
+    filter_json: full Notion meeting-notes filter instead, e.g.
+        {"property": "created_time", "filter": {"date_is_after": "2026-10-01"}}
+        or {"operator": "and", "filters": [...]}. Properties: title,
+        attendees, created_time, created_by, last_edited_time,
+        last_edited_by. Overrides title_contains.
+    sort_json: JSON array, e.g.
+        [{"property": "created_time", "direction": "descending"}].
+    limit: max results (1-50). There is no paging — narrow the filter.
+    """
+    filter_obj = json.loads(filter_json) if filter_json else None
+    if not filter_obj and title_contains:
+        filter_obj = {
+            "property": "title", "filter": {"string_contains": title_contains},
+        }
+    sort_obj = json.loads(sort_json) if sort_json else [
+        {"property": "created_time", "direction": "descending"},
+    ]
+    res = notion.query_meeting_notes(filter=filter_obj, sort=sort_obj, limit=limit)
+    notes = res.get("results", [])
+    if not notes:
+        return "No meeting notes found."
+    lines = [f"{len(notes)} meeting note(s):\n"]
+    for b in notes:
+        lines.extend(_meeting_notes_lines(b))
+    if res.get("has_more"):
+        lines.append("\nMore exist — narrow the filter to see them.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def notion_read_meeting_notes(block_id: str, section: str = "summary") -> str:
+    """Read one section of an AI meeting notes block.
+
+    block_id: the meeting notes block ID (from notion_query_meeting_notes,
+              or a "[Meeting notes: …]" line in notion_read_page output).
+    section:  "summary" (default), "notes" or "transcript".
+    """
+    section = section.strip().lower()
+    if section not in ("summary", "notes", "transcript"):
+        return 'section must be "summary", "notes" or "transcript".'
+    block = notion.retrieve_block(block_id)
+    if block.get("type") != "meeting_notes":
+        return f"Block {block_id} is a '{block.get('type')}' block, not meeting notes."
+    mn = block["meeting_notes"]
+    title = "".join(t.get("plain_text", "") for t in mn.get("title", []))
+    status = mn.get("status", "")
+    section_id = (mn.get("children") or {}).get(f"{section}_block_id")
+    header = f"# {title or '(untitled)'} — {section}\n  status: {status}"
+    if not section_id:
+        return f"{header}\n\n(no {section} yet — status is {status})"
+    content = blocks_to_markdown(notion.get_block_children_deep(section_id))
+    return f"{header}\n\n{content or '(empty)'}"
+
+
+@mcp.tool()
+def notion_create_meeting_notes(
+    source: str,
+    parent_page_id: str = "",
+    title: str = "",
+    language: str = "",
+    summarize: bool = True,
+) -> str:
+    """Create AI meeting notes (transcript + summary) from a recording.
+    Uses Notion AI; processing continues after this returns — poll with
+    notion_read_meeting_notes until its status is notes_ready.
+
+    NOT idempotent: calling it twice creates two sets of notes.
+
+    source: an audio/video file as `shared:<name>`, `local:<path>`,
+            `drive:<name-or-id>` — uploaded, then transcribed onto
+            parent_page_id — or `notion:<block_id>` to transcribe an audio
+            block that is already on a page (no parent_page_id then).
+    parent_page_id: page the notes are added to (file sources only).
+    title:    meeting title (Notion may refine it when summarising).
+    language: transcription hint such as "en" or "ja" (default: auto).
+    summarize: False transcribes without generating a summary.
+    """
+    scheme, _, value = source.partition(":")
+    if scheme == "notion":
+        src = {"type": "block", "block_id": value.strip()}
+        parent_page_id = ""
+    else:
+        if not parent_page_id:
+            return "parent_page_id is required when source is a file."
+        data, name, mime = _read_source(source)
+        if name.lower().endswith(".m4a"):
+            mime = "audio/mp4"  # the API rejects other types for .m4a
+        src = {
+            "type": "file_upload",
+            "file_upload_id": _upload_bytes_to_notion(data, name, mime),
+        }
+    block = notion.create_meeting_notes(
+        src, parent_page_id=parent_page_id, title=title,
+        language=language, kickoff_summary=summarize,
+    )
+    status = block.get("meeting_notes", {}).get("status", "processing")
+    return (
+        f"Meeting notes created:\n"
+        f"  Block ID: {block['id']}\n"
+        f"  Status: {status}\n"
+        f"Read them with notion_read_meeting_notes once status is notes_ready."
+    )
+
+
+@mcp.tool()
+def notion_list_custom_emojis(name: str = "") -> str:
+    """List the workspace's custom emojis. Use one as a page icon with
+    icon="custom_emoji:<name>" on notion_create_page / notion_update_page.
+
+    name: optional exact-name filter.
+    """
+    emojis = notion.list_custom_emojis(name=name)
+    if not emojis:
+        return "No custom emojis found."
+    lines = [f"{len(emojis)} custom emoji(s):\n"]
+    for e in emojis:
+        lines.append(f"  :{e.get('name', '')}:  id: {e['id']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def notion_list_file_uploads(status: str = "", limit: int = 20) -> str:
+    """List files this integration has uploaded to Notion, with their
+    status — useful for checking an import or finding an upload ID.
+
+    status: optional filter: pending | uploaded | expired | failed.
+    limit:  max results (1-100).
+    """
+    res = notion.list_file_uploads(status=status, page_size=limit)
+    uploads = res.get("results", [])
+    if not uploads:
+        return "No file uploads found."
+    lines = [f"{len(uploads)} file upload(s):\n"]
+    for u in uploads:
+        lines.append(f"  • {u.get('filename') or '(unnamed)'} [{u.get('status', '?')}]")
+        lines.append(f"      id: {u['id']}")
+        lines.append(
+            f"      {u.get('content_type') or '?'}, "
+            f"{u.get('content_length') or 0} bytes, created {u.get('created_time', '')}"
+        )
+    if res.get("has_more"):
+        lines.append("\nMore exist — filter by status or raise limit.")
+    return "\n".join(lines)
+
+
+def main():
     # Emit our per-request tool logs at INFO so they reach journald → Loki.
     # basicConfig writes to stderr, so this is safe for the stdio transport
     # too (stdout must stay pure JSON-RPC).
     logging.basicConfig(level=logging.INFO)
 
-    if "--stdio" in sys.argv:
-        # Local single-client mode: the MCP client spawns this process and
-        # owns it — no network surface, so no bearer token or uvicorn.
-        mcp.run(transport="stdio")
-        return
-
-    import uvicorn
-
-    # Streamable HTTP at /mcp, stateless: every tool call is an independent
-    # POST, so dropped connections and container restarts never strand a
-    # client session. (Legacy SSE was removed 2026-06 once all clients
-    # migrated.)
-    if not MCP_BEARER_TOKEN:
-        raise SystemExit(
-            "MCP_BEARER_TOKEN is not set. Refusing to start an unauthenticated "
-            "MCP server. Set it in .secrets.env and restart."
-        )
-    app = BearerAuthMiddleware(mcp.streamable_http_app(), expected_token=MCP_BEARER_TOKEN)
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    serve(mcp, port=PORT, bearer_token=MCP_BEARER_TOKEN)
 
 
 if __name__ == "__main__":

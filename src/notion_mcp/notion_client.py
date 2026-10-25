@@ -8,6 +8,7 @@ Covers the full public Notion API surface:
   - Users: list, retrieve
   - File uploads (3-stage single_part protocol)
   - Search
+  - Templates, meeting notes, custom emojis, async tasks
 """
 import logging
 import mimetypes
@@ -64,6 +65,14 @@ class NotionClient:
             if (r.status_code in self._RETRY_STATUSES
                     and attempt < self._MAX_ATTEMPTS):
                 retry_after = r.headers.get("Retry-After")
+                if not retry_after:
+                    # 2026-09: 429/529 bodies carry additional_data.retry_after.
+                    try:
+                        retry_after = (
+                            r.json().get("additional_data") or {}
+                        ).get("retry_after")
+                    except ValueError:
+                        retry_after = None
                 try:
                     delay = float(retry_after) if retry_after else backoff
                 except ValueError:
@@ -84,6 +93,38 @@ class NotionClient:
             )
         return r.json() if r.content else {}
 
+    # --- Async tasks (2026-06 allow_async) -------------------------------
+
+    _ASYNC_PENDING = ("queued", "running", "retrying")
+
+    def get_async_task(self, task_id: str) -> dict:
+        return self._request("GET", f"/async_tasks/{task_id}")
+
+    def wait_async(self, res: dict, timeout: float = 150.0) -> dict:
+        """Resolve an allow_async response. A normal (200) response is
+        returned unchanged; an async_task handle is polled until it
+        succeeds (returns the operation's result), fails (raises), or the
+        timeout passes (returns the still-pending task so the caller can
+        hand its id back). The default timeout stays under the MCP
+        client's 240s ceiling."""
+        if res.get("object") != "async_task":
+            return res
+        deadline = time.monotonic() + timeout
+        task = res
+        while task.get("status") in self._ASYNC_PENDING:
+            delay = min(max(float(task.get("poll_after_seconds") or 1), 0.5), 10.0)
+            if time.monotonic() + delay > deadline:
+                return task
+            time.sleep(delay)
+            task = self.get_async_task(task["id"])
+        if task.get("status") == "failed":
+            err = task.get("error") or {}
+            raise RuntimeError(
+                f"Notion async task {task.get('id')} failed: "
+                f"{err.get('code')}: {err.get('message')}"
+            )
+        return task.get("result") or task
+
     # --- Pages -----------------------------------------------------------
 
     def get_database(self, database_id: str) -> dict:
@@ -100,6 +141,13 @@ class NotionClient:
         return self._request(
             "PATCH", f"/pages/{page_id}", json={"properties": properties}
         )
+
+    def update_page(self, page_id: str, body: dict, silent: bool = False) -> dict:
+        """PATCH a page (properties / icon / cover). silent=True skips
+        update, @mention and Person notifications."""
+        if silent:
+            body = {**body, "notifications": {"mode": "silent"}}
+        return self._request("PATCH", f"/pages/{page_id}", json=body)
 
     @staticmethod
     def find_title_property(schema: dict) -> str:
@@ -142,10 +190,24 @@ class NotionClient:
         parent_page_id: str = "",
         database_id: str = "",
         children: list[dict] | None = None,
-        icon: str = "",
+        icon: str | dict = "",
         cover_url: str = "",
+        markdown: str = "",
+        markdown_version: str = "",
+        template: dict | None = None,
+        position: dict | None = None,
+        silent: bool = False,
     ) -> dict:
-        """Create a new page under a page or database."""
+        """Create a new page under a page or database.
+
+        icon is an emoji string or a full API icon object. markdown sends
+        the body through Notion's native markdown parser instead of
+        children (mutually exclusive); it is sent with allow_async, so the
+        return value may be a still-pending async_task if a very large
+        page outlasts the wait. template is the API template object
+        ({"type": "default"} or {"type": "template_id", ...}) and excludes
+        children. position places the page among a parent page's children.
+        """
         body: dict = {"properties": properties}
         if database_id:
             body["parent"] = {"database_id": database_id}
@@ -153,12 +215,30 @@ class NotionClient:
             body["parent"] = {"page_id": parent_page_id}
         else:
             raise ValueError("Either parent_page_id or database_id is required.")
+        if markdown and children:
+            raise ValueError("Pass markdown or children, not both.")
+        if template and children:
+            raise ValueError("A template supplies the page body; drop the content.")
         if children:
             body["children"] = children[:100]  # API limit
-        if icon:
+        if isinstance(icon, dict):
+            body["icon"] = icon
+        elif icon:
             body["icon"] = {"type": "emoji", "emoji": icon}
         if cover_url:
             body["cover"] = {"type": "external", "external": {"url": cover_url}}
+        if template:
+            body["template"] = template
+        if position:
+            body["position"] = position
+        if silent:
+            body["notifications"] = {"mode": "silent"}
+        if markdown:
+            body["markdown"] = markdown
+            body["allow_async"] = True
+            if markdown_version:
+                body["markdown_version"] = markdown_version
+            return self.wait_async(self._request("POST", "/pages", json=body))
         page = self._request("POST", "/pages", json=body)
         # Append remaining children in batches if > 100
         if children and len(children) > 100:
@@ -232,6 +312,7 @@ class NotionClient:
         sorts: list[dict] | None = None,
         page_size: int = 100,
         start_cursor: str = "",
+        is_archived: bool = False,
     ) -> dict:
         """Query a single page from a data source and return the raw
         pagination envelope ``{"results", "has_more", "next_cursor"}``.
@@ -249,9 +330,50 @@ class NotionClient:
             body["sorts"] = sorts
         if start_cursor:
             body["start_cursor"] = start_cursor
+        if is_archived:
+            body["is_archived"] = True
         return self._request(
             "POST", f"/data_sources/{data_source_id}/query", json=body,
+            headers=self._filter_beta_headers(filter),
         )
+
+    # Status-group filter operators are a beta that Notion gates behind a
+    # header (2026-10); send it only when a filter actually uses them.
+    _STATUS_GROUP_BETA = "status-group-filters-2026-10-06"
+
+    @classmethod
+    def _filter_beta_headers(cls, filter: dict | None) -> dict | None:
+        text = repr(filter) if filter else ""
+        if "group_equals" in text or "group_does_not_equal" in text:
+            return {"Notion-Beta": cls._STATUS_GROUP_BETA}
+        return None
+
+    def create_data_source(
+        self, database_id: str, title: str, properties: dict,
+    ) -> dict:
+        """Add another data source (table) to an existing database."""
+        body = {
+            "parent": {"type": "database_id", "database_id": database_id},
+            "title": [{"type": "text", "text": {"content": title}}],
+            "properties": properties,
+        }
+        return self._request("POST", "/data_sources", json=body)
+
+    def list_templates(self, data_source_id: str, name: str = "") -> list[dict]:
+        """List a data source's page templates ({id, name, is_default})."""
+        results: list[dict] = []
+        params: dict = {"page_size": 100}
+        if name:
+            params["name"] = name
+        while True:
+            res = self._request(
+                "GET", f"/data_sources/{data_source_id}/templates", params=params,
+            )
+            results.extend(res.get("templates", []))
+            if not res.get("has_more") or not res.get("next_cursor"):
+                break
+            params["start_cursor"] = res["next_cursor"]
+        return results
 
     def update_data_source(
         self,
@@ -276,48 +398,70 @@ class NotionClient:
 
     # --- Markdown (2025-09-03+) ------------------------------------------
 
-    def get_page_markdown(self, page_id: str) -> str:
-        """Retrieve a page's content as Notion-flavored markdown."""
-        res = self._request("GET", f"/pages/{page_id}/markdown")
+    def get_page_markdown(self, page_id: str, markdown_version: str = "") -> str:
+        """Retrieve a page's content as markdown. markdown_version 'v2'
+        opts into Notion-flavored Markdown (preview); default is v1."""
+        kw = {"params": {"markdown_version": markdown_version}} if markdown_version else {}
+        res = self._request("GET", f"/pages/{page_id}/markdown", **kw)
         return res.get("markdown", "")
 
     def update_page_markdown(
         self, page_id: str, old_text: str, new_text: str,
+        replace_all: bool = False, allow_deleting_content: bool = False,
     ) -> dict:
-        """Update page content via search-and-replace on markdown.
+        """Search-and-replace on a page's markdown via ``update_content``
+        (the recommended command; ``replace_content_range`` is deprecated).
 
-        Uses ``replace_content_range``: finds *old_text* and replaces
-        with *new_text*.
+        *old_text* must match exactly. If it matches several places the
+        API rejects the edit unless *replace_all* is set.
         """
+        update: dict = {"old_str": old_text, "new_str": new_text}
+        if replace_all:
+            update["replace_all_matches"] = True
+        cmd: dict = {"content_updates": [update]}
+        if allow_deleting_content:
+            cmd["allow_deleting_content"] = True
         return self._request(
             "PATCH", f"/pages/{page_id}/markdown",
-            json={
-                "type": "replace_content_range",
-                "replace_content_range": {
-                    "content_range": old_text,
-                    "content": new_text,
-                },
-            },
+            json={"type": "update_content", "update_content": cmd},
         )
 
-    def replace_page_markdown(self, page_id: str, markdown: str) -> dict:
-        """Replace a page's entire content with new markdown."""
-        return self._request(
-            "PATCH", f"/pages/{page_id}/markdown",
-            json={
-                "type": "replace_content",
-                "replace_content": {"new_str": markdown},
-            },
+    def replace_page_markdown(
+        self, page_id: str, markdown: str,
+        allow_deleting_content: bool = False, markdown_version: str = "",
+    ) -> dict:
+        """Replace a page's entire content with new markdown. Sent with
+        allow_async, so the result may be a still-pending async_task when
+        a very large page outlasts the wait."""
+        cmd: dict = {"new_str": markdown}
+        if allow_deleting_content:
+            cmd["allow_deleting_content"] = True
+        body: dict = {
+            "type": "replace_content", "replace_content": cmd,
+            "allow_async": True,
+        }
+        if markdown_version:
+            body["markdown_version"] = markdown_version
+        return self.wait_async(
+            self._request("PATCH", f"/pages/{page_id}/markdown", json=body)
         )
 
-    def insert_page_markdown(self, page_id: str, markdown: str) -> dict:
-        """Append markdown content to the end of a page."""
+    def insert_page_markdown(
+        self, page_id: str, markdown: str, position: str = "", after: str = "",
+    ) -> dict:
+        """Insert markdown into a page. position is 'start' or 'end'
+        (default: end); after is a "start text...end text" selection to
+        insert behind. They are mutually exclusive."""
+        if position and after:
+            raise ValueError("Pass position or after, not both.")
+        cmd: dict = {"content": markdown}
+        if after:
+            cmd["after"] = after
+        elif position:
+            cmd["position"] = {"type": position}
         return self._request(
             "PATCH", f"/pages/{page_id}/markdown",
-            json={
-                "type": "insert_content",
-                "insert_content": {"content": markdown},
-            },
+            json={"type": "insert_content", "insert_content": cmd},
         )
 
     # --- Move page (2025-09-03+) -----------------------------------------
@@ -338,20 +482,36 @@ class NotionClient:
     # --- Databases -------------------------------------------------------
 
     def create_database(
-        self, parent_page_id: str, title: str, properties: dict
+        self, parent_page_id: str, title: str = "",
+        properties: dict | None = None, database_type: str = "",
+        is_inline: bool = False,
     ) -> dict:
         """Create a new database under a page.
 
-        ``properties`` should be a dict mapping property names to their
-        type configs in Notion API format, e.g.::
+        ``properties`` maps property names to their type configs in Notion
+        API format, e.g.::
 
             {"Name": {"title": {}}, "Status": {"select": {"options": [...]}}}
+
+        ``database_type`` ('tasks', 'projects' or 'skills') creates one of
+        Notion's typed databases with its fixed schema instead; it cannot
+        be combined with ``properties``.
         """
-        body = {
-            "parent": {"type": "page_id", "page_id": parent_page_id},
-            "title": [{"type": "text", "text": {"content": title}}],
-            "properties": properties,
-        }
+        if database_type and properties:
+            raise ValueError(
+                "database_type databases have a fixed schema; drop the schema."
+            )
+        if not database_type and not properties:
+            raise ValueError("Provide a schema or a database_type.")
+        body: dict = {"parent": {"type": "page_id", "page_id": parent_page_id}}
+        if title:
+            body["title"] = [{"type": "text", "text": {"content": title}}]
+        if database_type:
+            body["database_type"] = database_type
+        else:
+            body["initial_data_source"] = {"properties": properties}
+        if is_inline:
+            body["is_inline"] = True
         return self._request("POST", "/databases", json=body)
 
     def query_database(
@@ -489,7 +649,7 @@ class NotionClient:
         # Caption is user-facing text, not a filename.
         name = (payload.get("name") or "").strip()
         if not name:
-            from urllib.parse import urlparse, unquote
+            from urllib.parse import unquote, urlparse
             name = unquote(urlparse(url).path.rsplit("/", 1)[-1]) or f"{block_id}.bin"
 
         with httpx.Client(timeout=120.0, follow_redirects=True) as c:
@@ -523,20 +683,38 @@ class NotionClient:
                     time.sleep(0.05)
         return blocks
 
-    def append_blocks(self, parent_id: str, children: list[dict]) -> list[dict]:
-        """Append child blocks to a page or block (batched at 100)."""
-        return self._append_batched(parent_id, children)
+    def append_blocks(
+        self, parent_id: str, children: list[dict],
+        position: dict | None = None, silent: bool = False,
+    ) -> list[dict]:
+        """Append child blocks to a page or block (batched at 100).
 
-    def _append_batched(self, parent_id: str, children: list[dict]) -> list[dict]:
+        position is the API position object ({"type": "start"} or
+        {"type": "after_block", ...}); None appends at the end."""
+        return self._append_batched(parent_id, children, position, silent)
+
+    def _append_batched(
+        self, parent_id: str, children: list[dict],
+        position: dict | None = None, silent: bool = False,
+    ) -> list[dict]:
         all_results: list[dict] = []
         for i in range(0, len(children), 100):
-            batch = children[i : i + 100]
+            body: dict = {"children": children[i : i + 100]}
+            if position:
+                body["position"] = position
+            if silent:
+                body["notifications"] = {"mode": "silent"}
             res = self._request(
-                "PATCH",
-                f"/blocks/{parent_id}/children",
-                json={"children": batch},
+                "PATCH", f"/blocks/{parent_id}/children", json=body,
             )
-            all_results.extend(res.get("results", []))
+            results = res.get("results", [])
+            all_results.extend(results)
+            # Keep later batches in order behind a positioned first batch.
+            if position and results:
+                position = {
+                    "type": "after_block",
+                    "after_block": {"id": results[-1]["id"]},
+                }
         return all_results
 
     def update_block(self, block_id: str, block_data: dict) -> dict:
@@ -577,6 +755,9 @@ class NotionClient:
         """Edit a comment this integration created (404 on others')."""
         body: dict = {"markdown": markdown} if markdown else {"rich_text": rich_text}
         return self._request("PATCH", f"/comments/{comment_id}", json=body)
+
+    def retrieve_comment(self, comment_id: str) -> dict:
+        return self._request("GET", f"/comments/{comment_id}")
 
     def delete_comment(self, comment_id: str) -> dict:
         """Delete a comment this integration created (404 on others')."""
@@ -718,7 +899,67 @@ class NotionClient:
         return results
 
     def get_user(self, user_id: str) -> dict:
+        """Retrieve a user; 'me' returns this integration's own bot user."""
         return self._request("GET", f"/users/{user_id}")
+
+    # --- Custom emojis ---------------------------------------------------
+
+    def list_custom_emojis(self, name: str = "") -> list[dict]:
+        """List workspace custom emojis ({id, name, url}); name is an
+        exact-match filter."""
+        results: list[dict] = []
+        params: dict = {"page_size": 100}
+        if name:
+            params["name"] = name
+        while True:
+            res = self._request("GET", "/custom_emojis", params=params)
+            results.extend(res.get("results", []))
+            if not res.get("has_more") or not res.get("next_cursor"):
+                break
+            params["start_cursor"] = res["next_cursor"]
+        return results
+
+    # --- Meeting notes ---------------------------------------------------
+
+    def query_meeting_notes(
+        self, filter: dict | None = None, sort: list[dict] | None = None,
+        limit: int = 20,
+    ) -> dict:
+        """Query AI meeting notes blocks. No cursors — the API returns up
+        to 50 and a has_more flag; narrow with filter/sort."""
+        body: dict = {"limit": max(1, min(50, limit))}
+        if filter:
+            body["filter"] = filter
+        if sort:
+            body["sort"] = sort
+        return self._request("POST", "/blocks/meeting_notes/query", json=body)
+
+    def create_meeting_notes(
+        self, source: dict, parent_page_id: str = "", title: str = "",
+        language: str = "", kickoff_summary: bool = True,
+    ) -> dict:
+        """Create AI meeting notes from uploaded media or an existing
+        audio block. NOT idempotent — a retry creates a duplicate — so
+        this bypasses _request's automatic retries."""
+        body: dict = {"source": source}
+        if parent_page_id:
+            body["parent"] = {"type": "page_id", "page_id": parent_page_id}
+        if title:
+            body["title"] = title
+        if language:
+            body["language"] = language
+        if not kickoff_summary:
+            body["options"] = {"kickoff_summary": False}
+        with httpx.Client(timeout=120.0) as c:
+            r = c.post(
+                f"{NOTION_API_BASE}/blocks/meeting_notes",
+                headers=self._headers(), json=body,
+            )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"Notion API POST /blocks/meeting_notes → {r.status_code}: {r.text}"
+            )
+        return r.json()
 
     # --- File uploads ----------------------------------------------------
 
@@ -781,6 +1022,27 @@ class NotionClient:
         """Fetch upload status — external_url imports are async and move
         pending → uploaded | failed."""
         return self._request("GET", f"/file_uploads/{upload_id}")
+
+    def list_file_uploads(self, status: str = "", page_size: int = 20) -> dict:
+        """One page of this integration's file uploads, newest first.
+        status filters to pending | uploaded | expired | failed."""
+        params: dict = {"page_size": max(1, min(100, page_size))}
+        if status:
+            params["status"] = status
+        return self._request("GET", "/file_uploads", params=params)
+
+    def attach_html_embed(
+        self, parent_id: str, upload_id: str, position: dict | None = None,
+    ) -> dict:
+        """Append an embed block that renders an uploaded .html file."""
+        body: dict = {"children": [{
+            "object": "block",
+            "type": "embed",
+            "embed": {"type": "file_upload", "file_upload": {"id": upload_id}},
+        }]}
+        if position:
+            body["position"] = position
+        return self._request("PATCH", f"/blocks/{parent_id}/children", json=body)
 
     def retrieve_block(self, block_id: str) -> dict:
         return self._request("GET", f"/blocks/{block_id}")
