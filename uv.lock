@@ -488,16 +488,16 @@ cli = [
 
 [[package]]
 name = "mcp-server-kit"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "mcp", extra = ["cli"] },
     { name = "uvicorn" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a0/ed/20a6e874109ac4236f632cb7c3e7bcc0af1902ff4fb7f42568b7a814f91b/mcp_server_kit-0.1.1.tar.gz", hash = "sha256:947d5dbc0386566683ebd56f17b217fbc02cc5ac38afa6d533e0b8c552f84b63", size = 142980, upload-time = "2026-10-25T11:42:15.438Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/08/b6/3cac69dedd6512d6fdd896770a0b8cebae73c4f42521eb148bba4a38e6b3/mcp_server_kit-0.1.2.tar.gz", hash = "sha256:825255dd94729c2bcbf90d6b12cdee35300b0413d3b3766830a56a9b5c9a5a33", size = 143812, upload-time = "2026-11-27T11:20:54.627Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d6/47/67de85bbe89a40e6a9b5f3e1112576603d65bd8ceb73e72dc196ed75a5cf/mcp_server_kit-0.1.1-py3-none-any.whl", hash = "sha256:bcd96875501dd290d8424869494e9313486605cdbe6c77b3dca01d533ba13b68", size = 18441, upload-time = "2026-10-25T11:42:14.442Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/4e/93e921d1ac45dc07909b47e8ddb93a7c96e6679227935fc351fcb3c2fa20/mcp_server_kit-0.1.2-py3-none-any.whl", hash = "sha256:ba2e5e1a0693e57bbd1aa1d6ec19bdd4dccc795215c5d24846759bba488d34f0", size = 18899, upload-time = "2026-11-27T11:20:53.522Z" },
 ]
 
 [package.optional-dependencies]
@@ -542,7 +542,7 @@ requires-dist = [
     { name = "google-auth-httplib2", specifier = ">=0.2.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.0.0" },
-    { name = "mcp-server-kit", extras = ["pdf"], specifier = ">=0.1.1,<0.2" },
+    { name = "mcp-server-kit", extras = ["pdf"], specifier = ">=0.1.2,<0.2" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
 ]
 provides-extras = ["test"]
